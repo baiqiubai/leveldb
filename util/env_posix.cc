@@ -9,11 +9,6 @@
 #ifndef __Fuchsia__
 #include <sys/resource.h>
 #endif
-#include <sys/stat.h>
-#include <sys/time.h>
-#include <sys/types.h>
-#include <unistd.h>
-
 #include <atomic>
 #include <cerrno>
 #include <cstddef>
@@ -21,17 +16,23 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <fcntl.h>
 #include <limits>
 #include <queue>
 #include <set>
 #include <string>
+#include <sys/stat.h>
+#include <sys/time.h>
+#include <sys/types.h>
 #include <thread>
 #include <type_traits>
+#include <unistd.h>
 #include <utility>
 
 #include "leveldb/env.h"
 #include "leveldb/slice.h"
 #include "leveldb/status.h"
+
 #include "port/port.h"
 #include "port/thread_annotations.h"
 #include "util/env_posix_test_helper.h"
@@ -246,6 +247,48 @@ class PosixMmapReadableFile final : public RandomAccessFile {
   const size_t length_;
   Limiter* const mmap_limiter_;
   const std::string filename_;
+};
+
+class PosixRandomWriteFile final : public RandomWriteFile {
+ public:
+  PosixRandomWriteFile(std::string filename, int fd)
+      : filename_(filename), fd_(fd) {}
+
+  Status Close() override {
+    if (fd_ != -1) {
+      ::close(fd_);
+      fd_ = -1;
+    }
+  }
+
+  ~PosixRandomWriteFile() override { Close(); }
+
+  Status Sync() override {
+    if (fd_ != -1) {
+      ::fsync(fd_);
+    }
+  }
+
+  Status Write(const Slice& buffer, size_t count, off_t offset) override {
+    if (count > buffer.size()) {
+      return Status::IOError("bytes overflow ");
+    }
+    if (::pwrite(fd_, buffer.data(), count, offset) == -1) {
+      return PosixError(filename_, errno);
+    }
+    return Status::OK();
+  }
+
+  Status Fallocate(uint64_t head, uint64_t len) override {
+    if (::fallocate(fd_, FALLOC_FL_PUNCH_HOLE, head, len) == -1) {
+      return PosixError(filename_, errno);
+    }
+    return Status::OK();
+  }
+
+ private:
+  const std::string filename_;
+  int fd_;
 };
 
 class PosixWritableFile final : public WritableFile {
@@ -567,6 +610,17 @@ class PosixEnv : public Env {
     }
 
     *result = new PosixWritableFile(filename, fd);
+    return Status::OK();
+  }
+
+  Status NewRandomWriteFile(const std::string& filename,
+                            RandomWriteFile** result) override {
+    int fd = ::open(filename.c_str(), O_RDWR | O_CREAT | kOpenBaseFlags, 0644);
+    if (fd < 0) {
+      *result = nullptr;
+      return PosixError(filename, errno);
+    }
+    *result = new PosixRandomWriteFile(filename, fd);
     return Status::OK();
   }
 

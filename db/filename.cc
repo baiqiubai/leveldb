@@ -4,11 +4,12 @@
 
 #include "db/filename.h"
 
+#include "db/dbformat.h"
 #include <cassert>
 #include <cstdio>
 
-#include "db/dbformat.h"
 #include "leveldb/env.h"
+
 #include "util/logging.h"
 
 namespace leveldb {
@@ -66,6 +67,12 @@ std::string InfoLogFileName(const std::string& dbname) {
 // Return the name of the old info log file for "dbname".
 std::string OldInfoLogFileName(const std::string& dbname) {
   return dbname + "/LOG.old";
+}
+
+std::string vLogFileName(const std::string& dbname) { return dbname + "/vLOG"; }
+
+std::string vLogValidIntervalFileName(const std::string& dbname) {
+  return dbname + "/InternalVLOG";
 }
 
 // Owned filenames have the form:

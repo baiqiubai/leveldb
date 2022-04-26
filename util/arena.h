@@ -34,6 +34,14 @@ class Arena {
     return memory_usage_.load(std::memory_order_relaxed);
   }
 
+  size_t KeyMemoryUsage() const {
+    return key_memory_usage_.load(std::memory_order_relaxed);
+  }
+
+  void AddKeyMemoryUsage(size_t size) {
+    key_memory_usage_.fetch_add(size, std::memory_order_relaxed);
+  }
+
  private:
   char* AllocateFallback(size_t bytes);
   char* AllocateNewBlock(size_t block_bytes);
@@ -50,6 +58,8 @@ class Arena {
   // TODO(costan): This member is accessed via atomics, but the others are
   //               accessed without any locking. Is this OK?
   std::atomic<size_t> memory_usage_;
+
+  std::atomic<size_t> key_memory_usage_;
 };
 
 inline char* Arena::Allocate(size_t bytes) {

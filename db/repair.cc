@@ -34,6 +34,7 @@
 #include "db/table_cache.h"
 #include "db/version_edit.h"
 #include "db/write_batch_internal.h"
+
 #include "leveldb/comparator.h"
 #include "leveldb/db.h"
 #include "leveldb/env.h"
@@ -202,8 +203,13 @@ class Repairer {
     // since ExtractMetaData() will also generate edits.
     FileMetaData meta;
     meta.number = next_file_number_++;
+
+    // TODO
+    vLog* vlog = nullptr;
+
     Iterator* iter = mem->NewIterator();
-    status = BuildTable(dbname_, env_, options_, table_cache_, iter, &meta);
+    status =
+        BuildTable(dbname_, env_, options_, table_cache_, iter, &meta, vlog);
     delete iter;
     mem->Unref();
     mem = nullptr;

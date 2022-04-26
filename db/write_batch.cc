@@ -18,7 +18,9 @@
 #include "db/dbformat.h"
 #include "db/memtable.h"
 #include "db/write_batch_internal.h"
+
 #include "leveldb/db.h"
+
 #include "util/coding.h"
 
 namespace leveldb {
@@ -56,6 +58,8 @@ Status WriteBatch::Iterate(Handler* handler) const {
       case kTypeValue:
         if (GetLengthPrefixedSlice(&input, &key) &&
             GetLengthPrefixedSlice(&input, &value)) {
+          fprintf(stderr, "key_size %ld,value_size %ld\n", key.size(),
+                  value.size());
           handler->Put(key, value);
         } else {
           return Status::Corruption("bad WriteBatch Put");

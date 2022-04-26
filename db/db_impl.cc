@@ -4,14 +4,6 @@
 
 #include "db/db_impl.h"
 
-#include <algorithm>
-#include <atomic>
-#include <cstdint>
-#include <cstdio>
-#include <set>
-#include <string>
-#include <vector>
-
 #include "db/builder.h"
 #include "db/db_iter.h"
 #include "db/dbformat.h"
@@ -22,11 +14,21 @@
 #include "db/table_cache.h"
 #include "db/version_set.h"
 #include "db/write_batch_internal.h"
+#include <algorithm>
+#include <atomic>
+#include <cstdint>
+#include <cstdio>
+#include <iostream>
+#include <set>
+#include <string>
+#include <vector>
+
 #include "leveldb/db.h"
 #include "leveldb/env.h"
 #include "leveldb/status.h"
 #include "leveldb/table.h"
 #include "leveldb/table_builder.h"
+
 #include "port/port.h"
 #include "table/block.h"
 #include "table/merger.h"
@@ -147,7 +149,8 @@ DBImpl::DBImpl(const Options& raw_options, const std::string& dbname)
       background_compaction_scheduled_(false),
       manual_compaction_(nullptr),
       versions_(new VersionSet(dbname_, &options_, table_cache_,
-                               &internal_comparator_)) {}
+                               &internal_comparator_)),
+      vlog_(new vLog(this, &options_, env_, vLogFileName(dbname_))) {}
 
 DBImpl::~DBImpl() {
   // Wait for background work to finish.
@@ -176,6 +179,15 @@ DBImpl::~DBImpl() {
   if (owns_cache_) {
     delete options_.block_cache;
   }
+}
+
+std::string DBImpl::GetName() const { return dbname_; }
+
+Status DBImpl::StartGC() {
+  if (vlog_ != nullptr) {
+    return vlog_->StartGC();
+  }
+  return Status::NotSupported("No GC");
 }
 
 Status DBImpl::NewDB() {
@@ -210,6 +222,11 @@ Status DBImpl::NewDB() {
   } else {
     env_->RemoveFile(manifest);
   }
+
+  if (s.ok()) {
+    s = vlog_->PersistenceInterval();  //持久化tail and head
+  }
+
   return s;
 }
 
@@ -302,7 +319,12 @@ Status DBImpl::Recover(VersionEdit* edit, bool* save_manifest) {
     return s;
   }
 
-  if (!env_->FileExists(CurrentFileName(dbname_))) {
+  bool has_current_file =
+      (env_->FileExists(CurrentFileName(dbname_))) ? true : false;
+  bool has_interval_vlog_file =
+      (env_->FileExists(vLogValidIntervalFileName(dbname_))) ? true : false;
+
+  if (!has_current_file || !has_interval_vlog_file) {
     if (options_.create_if_missing) {
       Log(options_.info_log, "Creating DB %s since it was missing.",
           dbname_.c_str());
@@ -325,6 +347,12 @@ Status DBImpl::Recover(VersionEdit* edit, bool* save_manifest) {
   if (!s.ok()) {
     return s;
   }
+
+  s = vlog_->ParseValidInterval();  //还原有效区间
+  if (!s.ok()) {
+    return s;
+  }
+
   SequenceNumber max_sequence(0);
 
   // Recover from all newer log files than the ones named in the
@@ -516,7 +544,10 @@ Status DBImpl::WriteLevel0Table(MemTable* mem, VersionEdit* edit,
   Status s;
   {
     mutex_.Unlock();
-    s = BuildTable(dbname_, env_, options_, table_cache_, iter, &meta);
+    if (s.ok()) {
+      s = BuildTable(dbname_, env_, options_, table_cache_, iter, &meta,
+                     vlog_.get());
+    }
     mutex_.Lock();
   }
 
@@ -1051,7 +1082,6 @@ Status DBImpl::DoCompactionWork(CompactionState* compact) {
 }
 
 namespace {
-
 struct IterState {
   port::Mutex* const mu;
   Version* const version GUARDED_BY(mu);
@@ -1346,6 +1376,8 @@ Status DBImpl::MakeRoomForWrite(bool force) {
       mutex_.Lock();
     } else if (!force &&
                (mem_->ApproximateMemoryUsage() <= options_.write_buffer_size)) {
+      Log(options_.info_log, "MemTable MemoryUsage %ld",
+          mem_->ApproximateMemoryUsage());
       // There is room in current memtable
       break;
     } else if (imm_ != nullptr) {

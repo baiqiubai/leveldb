@@ -4,18 +4,20 @@
 
 #include "db/version_set.h"
 
-#include <algorithm>
-#include <cstdio>
-
 #include "db/filename.h"
 #include "db/log_reader.h"
 #include "db/log_writer.h"
 #include "db/memtable.h"
 #include "db/table_cache.h"
+#include <algorithm>
+#include <cstdio>
+
 #include "leveldb/env.h"
 #include "leveldb/table_builder.h"
+
 #include "table/merger.h"
 #include "table/two_level_iterator.h"
+#include "table/vlog_format.h"
 #include "util/coding.h"
 #include "util/logging.h"
 
@@ -268,6 +270,8 @@ struct Saver {
   const Comparator* ucmp;
   Slice user_key;
   std::string* value;
+
+  vLog* vlog_;
 };
 }  // namespace
 static void SaveValue(void* arg, const Slice& ikey, const Slice& v) {
@@ -277,9 +281,15 @@ static void SaveValue(void* arg, const Slice& ikey, const Slice& v) {
     s->state = kCorrupt;
   } else {
     if (s->ucmp->Compare(parsed_key.user_key, s->user_key) == 0) {
-      s->state = (parsed_key.type == kTypeValue) ? kFound : kDeleted;
+      uint64_t offset = DecodeFixed64(v.data());
+      if (offset < s->vlog_->Tail() || offset > s->vlog_->Head()) {
+        s->state = kDeleted;
+      } else {
+        s->state = (parsed_key.type == kTypeValue) ? kFound : kDeleted;
+      }
       if (s->state == kFound) {
-        s->value->assign(v.data(), v.size());
+        s->vlog_->Get(offset, s->value);
+        // s->value->assign(v.data(), v.size());
       }
     }
   }
@@ -1496,8 +1506,7 @@ Compaction::Compaction(const Options* options, int level)
       input_version_(nullptr),
       grandparent_index_(0),
       seen_key_(false),
-      overlapped_bytes_(0) {
-}
+      overlapped_bytes_(0) {}
 
 Compaction::~Compaction() {
   if (input_version_ != nullptr) {

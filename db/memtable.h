@@ -5,11 +5,12 @@
 #ifndef STORAGE_LEVELDB_DB_MEMTABLE_H_
 #define STORAGE_LEVELDB_DB_MEMTABLE_H_
 
-#include <string>
-
 #include "db/dbformat.h"
 #include "db/skiplist.h"
+#include <string>
+
 #include "leveldb/db.h"
+
 #include "util/arena.h"
 
 namespace leveldb {
@@ -41,6 +42,8 @@ class MemTable {
   // Returns an estimate of the number of bytes of data in use by this
   // data structure. It is safe to call when MemTable is being modified.
   size_t ApproximateMemoryUsage();
+
+  size_t ApproximateKeyMemoryUsage();
 
   // Return an iterator that yields the contents of the memtable.
   //

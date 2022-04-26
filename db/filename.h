@@ -12,6 +12,7 @@
 
 #include "leveldb/slice.h"
 #include "leveldb/status.h"
+
 #include "port/port.h"
 
 namespace leveldb {
@@ -66,6 +67,10 @@ std::string InfoLogFileName(const std::string& dbname);
 
 // Return the name of the old info log file for "dbname".
 std::string OldInfoLogFileName(const std::string& dbname);
+
+std::string vLogFileName(const std::string& dbname);
+
+std::string vLogValidIntervalFileName(const std::string& dbname);
 
 // If filename is a leveldb file, store the type of the file in *type.
 // The number encoded in the filename is stored in *number.  If the

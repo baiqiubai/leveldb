@@ -45,6 +45,7 @@ class FileLock;
 class Logger;
 class RandomAccessFile;
 class SequentialFile;
+class RandomWriteFile;
 class Slice;
 class WritableFile;
 
@@ -109,6 +110,9 @@ class LEVELDB_EXPORT Env {
   // an Env that does not support appending.
   virtual Status NewAppendableFile(const std::string& fname,
                                    WritableFile** result);
+
+  virtual Status NewRandomWriteFile(const std::string& fname,
+                                    RandomWriteFile** result);
 
   // Returns true iff the named file exists.
   virtual bool FileExists(const std::string& fname) = 0;
@@ -287,6 +291,22 @@ class LEVELDB_EXPORT WritableFile {
   virtual Status Close() = 0;
   virtual Status Flush() = 0;
   virtual Status Sync() = 0;
+};
+
+class LEVELDB_EXPORT RandomWriteFile {
+ public:
+  RandomWriteFile() = default;
+
+  RandomWriteFile(const RandomWriteFile&) = delete;
+  RandomWriteFile& operator=(const RandomWriteFile&) = delete;
+
+  virtual ~RandomWriteFile();
+
+  virtual Status Write(const Slice& buffer, size_t count, off_t offset) = 0;
+  virtual Status Close() = 0;
+  virtual Status Sync() = 0;
+
+  virtual Status Fallocate(uint64_t head, uint64_t len) = 0;
 };
 
 // An interface for writing log messages.

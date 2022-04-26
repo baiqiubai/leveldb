@@ -21,6 +21,10 @@ Env::~Env() = default;
 Status Env::NewAppendableFile(const std::string& fname, WritableFile** result) {
   return Status::NotSupported("NewAppendableFile", fname);
 }
+Status Env::NewRandomWriteFile(const std::string& fname,
+                               RandomWriteFile** result) {
+  return Status::NotSupported("NewRandomWriteFile", fname);
+}
 
 Status Env::RemoveDir(const std::string& dirname) { return DeleteDir(dirname); }
 Status Env::DeleteDir(const std::string& dirname) { return RemoveDir(dirname); }
@@ -33,6 +37,8 @@ SequentialFile::~SequentialFile() = default;
 RandomAccessFile::~RandomAccessFile() = default;
 
 WritableFile::~WritableFile() = default;
+
+RandomWriteFile::~RandomWriteFile() = default;
 
 Logger::~Logger() = default;
 

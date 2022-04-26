@@ -127,6 +127,7 @@ target_sources(leveldb
     "db/db_impl.h"
     "db/db_iter.cc"
     "db/db_iter.h"
+    "db/repair.cc"
     "db/dbformat.cc"
     "db/dbformat.h"
     "db/dumpfile.cc"
@@ -139,7 +140,6 @@ target_sources(leveldb
     "db/log_writer.h"
     "db/memtable.cc"
     "db/memtable.h"
-    "db/repair.cc"
     "db/skiplist.h"
     "db/snapshot.h"
     "db/table_cache.cc"
@@ -161,6 +161,8 @@ target_sources(leveldb
     "table/filter_block.h"
     "table/format.cc"
     "table/format.h"
+    "table/vlog_format.h"
+    "table/vlog_format.cc"
     "table/iterator_wrapper.h"
     "table/iterator.cc"
     "table/merger.cc"
@@ -352,7 +354,7 @@ if(LEVELDB_BUILD_TESTS)
   if(NOT BUILD_SHARED_LIBS)
     leveldb_test("db/autocompact_test.cc")
     leveldb_test("db/corruption_test.cc")
-    leveldb_test("db/db_test.cc")
+   # leveldb_test("db/db_test.cc")
     leveldb_test("db/dbformat_test.cc")
     leveldb_test("db/filename_test.cc")
     leveldb_test("db/log_test.cc")
@@ -366,6 +368,7 @@ if(LEVELDB_BUILD_TESTS)
 
     leveldb_test("table/filter_block_test.cc")
     leveldb_test("table/table_test.cc")
+    leveldb_test("table/vlog_format_test.cc")
 
     leveldb_test("util/arena_test.cc")
     leveldb_test("util/bloom_test.cc")
