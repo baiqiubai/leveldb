@@ -72,7 +72,7 @@ std::string OldInfoLogFileName(const std::string& dbname) {
 std::string vLogFileName(const std::string& dbname) { return dbname + "/vLOG"; }
 
 std::string vLogValidIntervalFileName(const std::string& dbname) {
-  return dbname + "/InternalVLOG";
+  return dbname + "/IntervalVLOG";
 }
 
 // Owned filenames have the form:
@@ -94,6 +94,9 @@ bool ParseFileName(const std::string& filename, uint64_t* number,
   } else if (rest == "LOG" || rest == "LOG.old") {
     *number = 0;
     *type = kInfoLogFile;
+  } else if (rest == "vLOG" || rest == "IntervalVLOG") {
+    *number = 0;
+    *type = kVLog;
   } else if (rest.starts_with("MANIFEST-")) {
     rest.remove_prefix(strlen("MANIFEST-"));
     uint64_t num;

@@ -259,6 +259,7 @@ class PosixRandomWriteFile final : public RandomWriteFile {
       ::close(fd_);
       fd_ = -1;
     }
+    return Status::OK();
   }
 
   ~PosixRandomWriteFile() override { Close(); }
@@ -280,7 +281,8 @@ class PosixRandomWriteFile final : public RandomWriteFile {
   }
 
   Status Fallocate(uint64_t head, uint64_t len) override {
-    if (::fallocate(fd_, FALLOC_FL_PUNCH_HOLE, head, len) == -1) {
+    if (::fallocate(fd_, FALLOC_FL_PUNCH_HOLE | FALLOC_FL_KEEP_SIZE, head,
+                    len) == -1) {
       return PosixError(filename_, errno);
     }
     return Status::OK();
@@ -317,6 +319,7 @@ class PosixWritableFile final : public WritableFile {
     write_data += copy_size;
     write_size -= copy_size;
     pos_ += copy_size;
+
     if (write_size == 0) {
       return Status::OK();
     }
@@ -562,7 +565,9 @@ class PosixEnv : public Env {
       return PosixError(filename, errno);
     }
 
-    if (!mmap_limiter_.Acquire()) {
+    if (!mmap_limiter_.Acquire() ||
+        filename.substr(filename.size() - 4, filename.size()) ==
+            "vLOG") {  // vLOG会动态增长 暂时不用mmap
       *result = new PosixRandomAccessFile(filename, fd, &fd_limiter_);
       return Status::OK();
     }

@@ -6,6 +6,7 @@
 
 #include "leveldb/comparator.h"
 #include "leveldb/iterator.h"
+
 #include "table/iterator_wrapper.h"
 
 namespace leveldb {
@@ -127,6 +128,8 @@ class MergingIterator : public Iterator {
     }
     return status;
   }
+
+  Iterator* current() const override { return current_->current(); }
 
  private:
   // Which direction is the iterator moving?

@@ -18,7 +18,7 @@ class Env;
 class Iterator;
 class TableCache;
 class VersionEdit;
-class vLog;
+class VLog;
 class DB;
 // Build a Table file from the contents of *iter.  The generated file
 // will be named according to meta->number.  On success, the rest of
@@ -27,7 +27,7 @@ class DB;
 // zero, and no Table file will be produced.
 Status BuildTable(const std::string& dbname, Env* env, const Options& options,
                   TableCache* table_cache, Iterator* iter, FileMetaData* meta,
-                  vLog* vlog);
+                  VLog* vlog);
 }  // namespace leveldb
 
 #endif  // STORAGE_LEVELDB_DB_BUILDER_H_

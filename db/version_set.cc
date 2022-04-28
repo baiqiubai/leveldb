@@ -209,6 +209,9 @@ class Version::LevelFileNumIterator : public Iterator {
     EncodeFixed64(value_buf_ + 8, (*flist_)[index_]->file_size);
     return Slice(value_buf_, sizeof(value_buf_));
   }
+
+  Iterator* current() const override { return nullptr; }
+
   Status status() const override { return Status::OK(); }
 
  private:
@@ -271,7 +274,7 @@ struct Saver {
   Slice user_key;
   std::string* value;
 
-  vLog* vlog_;
+  VLog* vlog_;
 };
 }  // namespace
 static void SaveValue(void* arg, const Slice& ikey, const Slice& v) {
@@ -414,6 +417,7 @@ Status Version::Get(const ReadOptions& options, const LookupKey& k,
   state.saver.ucmp = vset_->icmp_.user_comparator();
   state.saver.user_key = k.user_key();
   state.saver.value = value;
+  state.saver.vlog_ = vset_->vlog_;
 
   ForEachOverlapping(state.saver.user_key, state.ikey, &state, &State::Match);
 
@@ -753,7 +757,7 @@ class VersionSet::Builder {
 
 VersionSet::VersionSet(const std::string& dbname, const Options* options,
                        TableCache* table_cache,
-                       const InternalKeyComparator* cmp)
+                       const InternalKeyComparator* cmp, VLog* vlog)
     : env_(options->env),
       dbname_(dbname),
       options_(options),
@@ -767,7 +771,8 @@ VersionSet::VersionSet(const std::string& dbname, const Options* options,
       descriptor_file_(nullptr),
       descriptor_log_(nullptr),
       dummy_versions_(this),
-      current_(nullptr) {
+      current_(nullptr),
+      vlog_(vlog) {
   AppendVersion(new Version(this));
 }
 

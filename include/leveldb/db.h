@@ -146,9 +146,9 @@ class LEVELDB_EXPORT DB {
   //    db->CompactRange(nullptr, nullptr);
   virtual void CompactRange(const Slice* begin, const Slice* end) = 0;
 
-  virtual std::string GetName() const = 0;
+  // virtual std::string GetName() const = 0;
 
-  virtual Status StartGC() = 0;
+  //  virtual Status StartGC() = 0;
 };
 
 // Destroy the contents of the specified database.

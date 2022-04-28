@@ -26,6 +26,7 @@ enum FileType {
   kDescriptorFile,
   kCurrentFile,
   kTempFile,
+  kVLog,
   kInfoLogFile  // Either the current one, or an old one
 };
 

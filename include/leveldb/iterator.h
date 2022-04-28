@@ -72,6 +72,8 @@ class LEVELDB_EXPORT Iterator {
   // If an error has occurred, return it.  Else return an ok status.
   virtual Status status() const = 0;
 
+  virtual Iterator* current() const;
+
   // Clients are allowed to register function/arg1/arg2 triples that
   // will be invoked when this iterator is destroyed.
   //

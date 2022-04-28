@@ -48,33 +48,28 @@ static const char* EncodeKey(std::string* scratch, const Slice& target) {
   return scratch->data();
 }
 
-class MemTableIterator : public Iterator {
- public:
-  explicit MemTableIterator(MemTable::Table* table) : iter_(table) {}
+bool MemTableIterator::Valid() const { return iter_.Valid(); }
 
-  MemTableIterator(const MemTableIterator&) = delete;
-  MemTableIterator& operator=(const MemTableIterator&) = delete;
+void MemTableIterator::Seek(const Slice& k) { iter_.Seek(EncodeKey(&tmp_, k)); }
 
-  ~MemTableIterator() override = default;
+void MemTableIterator::SeekToFirst() { iter_.SeekToFirst(); }
 
-  bool Valid() const override { return iter_.Valid(); }
-  void Seek(const Slice& k) override { iter_.Seek(EncodeKey(&tmp_, k)); }
-  void SeekToFirst() override { iter_.SeekToFirst(); }
-  void SeekToLast() override { iter_.SeekToLast(); }
-  void Next() override { iter_.Next(); }
-  void Prev() override { iter_.Prev(); }
-  Slice key() const override { return GetLengthPrefixedSlice(iter_.key()); }
-  Slice value() const override {
-    Slice key_slice = GetLengthPrefixedSlice(iter_.key());
-    return GetLengthPrefixedSlice(key_slice.data() + key_slice.size());
-  }
+void MemTableIterator::SeekToLast() { iter_.SeekToLast(); }
 
-  Status status() const override { return Status::OK(); }
+void MemTableIterator::Next() { iter_.Next(); }
 
- private:
-  MemTable::Table::Iterator iter_;
-  std::string tmp_;  // For passing to EncodeKey
-};
+void MemTableIterator::Prev() { iter_.Prev(); }
+
+Slice MemTableIterator::key() const {
+  return GetLengthPrefixedSlice(iter_.key());
+}
+
+Slice MemTableIterator::value() const {
+  Slice key_slice = GetLengthPrefixedSlice(iter_.key());
+  return GetLengthPrefixedSlice(key_slice.data() + key_slice.size());
+}
+
+Status MemTableIterator::status() const { return Status::OK(); }
 
 Iterator* MemTable::NewIterator() { return new MemTableIterator(&table_); }
 

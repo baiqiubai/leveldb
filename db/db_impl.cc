@@ -33,9 +33,11 @@
 #include "table/block.h"
 #include "table/merger.h"
 #include "table/two_level_iterator.h"
+#include "table/vlog_format.h"
 #include "util/coding.h"
 #include "util/logging.h"
 #include "util/mutexlock.h"
+#include "util/prefetcher.h"
 
 namespace leveldb {
 
@@ -148,9 +150,10 @@ DBImpl::DBImpl(const Options& raw_options, const std::string& dbname)
       tmp_batch_(new WriteBatch),
       background_compaction_scheduled_(false),
       manual_compaction_(nullptr),
+      vlog_(new VLog(this, &options_, env_, vLogFileName(dbname_))),
       versions_(new VersionSet(dbname_, &options_, table_cache_,
-                               &internal_comparator_)),
-      vlog_(new vLog(this, &options_, env_, vLogFileName(dbname_))) {}
+                               &internal_comparator_, vlog_.get())),
+      prefetcher_(new Prefetcher(this, vlog_.get())) {}
 
 DBImpl::~DBImpl() {
   // Wait for background work to finish.
@@ -164,6 +167,8 @@ DBImpl::~DBImpl() {
   if (db_lock_ != nullptr) {
     env_->UnlockFile(db_lock_);
   }
+
+  prefetcher_.reset();  //必须reset??不知道为什么..明明按照声明顺序反向析构的
 
   delete versions_;
   if (mem_ != nullptr) mem_->Unref();
@@ -188,6 +193,14 @@ Status DBImpl::StartGC() {
     return vlog_->StartGC();
   }
   return Status::NotSupported("No GC");
+}
+
+VLog* DBImpl::GetVLog() { return vlog_.get(); }
+
+Status DBImpl::ScanCountOfValue(const ReadOptions& options, const Slice& start,
+                                uint32_t count,
+                                std::vector<std::string>* result) {
+  return prefetcher_->Fetch(options, start, count, result);
 }
 
 Status DBImpl::NewDB() {
@@ -1376,8 +1389,8 @@ Status DBImpl::MakeRoomForWrite(bool force) {
       mutex_.Lock();
     } else if (!force &&
                (mem_->ApproximateMemoryUsage() <= options_.write_buffer_size)) {
-      Log(options_.info_log, "MemTable MemoryUsage %ld",
-          mem_->ApproximateMemoryUsage());
+      /* Log(options_.info_log, "MemTable MemoryUsage %ld",
+           mem_->ApproximateMemoryUsage());*/
       // There is room in current memtable
       break;
     } else if (imm_ != nullptr) {

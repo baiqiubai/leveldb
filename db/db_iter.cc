@@ -7,8 +7,10 @@
 #include "db/db_impl.h"
 #include "db/dbformat.h"
 #include "db/filename.h"
+
 #include "leveldb/env.h"
 #include "leveldb/iterator.h"
+
 #include "port/port.h"
 #include "util/logging.h"
 #include "util/mutexlock.h"
@@ -82,6 +84,7 @@ class DBIter : public Iterator {
   void Seek(const Slice& target) override;
   void SeekToFirst() override;
   void SeekToLast() override;
+  Iterator* current() const override;
 
  private:
   void FindNextUserEntry(bool skipping, std::string* skip);
@@ -306,6 +309,8 @@ void DBIter::SeekToLast() {
   iter_->SeekToLast();
   FindPrevUserEntry();
 }
+
+Iterator* DBIter::current() const { return iter_; }
 
 }  // anonymous namespace
 

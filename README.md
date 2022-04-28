@@ -28,7 +28,7 @@ Authors: Sanjay Ghemawat (sanjay@google.com) and Jeff Dean (jeff@google.com)
 
 # Getting the Source
 
-```bash
+```basht
 git clone --recurse-submodules https://github.com/google/leveldb.git
 ```
 

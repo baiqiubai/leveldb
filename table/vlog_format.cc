@@ -1,39 +1,60 @@
 #include "table/vlog_format.h"
 
+#include "db/db_impl.h"
 #include "db/filename.h"
-#include <iostream>
 
+#include "util/coding.h"
+
+#include "include/leveldb/db.h"
+#include "include/leveldb/env.h"
 #include "include/leveldb/options.h"
+#include "include/leveldb/slice.h"
 
 namespace leveldb {
 
-vLog::vLog(DB* db, const Options* options, Env* env,
+VLog::VLog(DB* db, const Options* options, Env* env,
            const std::string& vlog_name)
     : db_(db),
       options_(options),
       env_(env),
       name_(vlog_name),
-      write_vlog_(nullptr),
-      read_vlog_(nullptr),
+      random_write_vlog_(nullptr),
+      random_read_vlog_(nullptr),
       persistence_write_(nullptr),
       persistence_read_(nullptr),
       offset_(0),
       tail_(0),
-      head_(0) {}
+      head_(0) {
+  Status s = InitAllFile();
+  assert(s.ok());
+}
 
-vLog::~vLog() {
+VLog::~VLog() {
   PersistenceInterval();
-  delete write_vlog_;
-  delete read_vlog_;
+  delete append_vlog_;
+  delete random_write_vlog_;
+  delete random_read_vlog_;
   delete persistence_write_;
   delete persistence_read_;
 }
 
-void vLog::IncreaseOffset(const std::string& value) { offset_ += value.size(); }
+Status VLog::InitAllFile() {
+  Status s;
+  s = env_->NewAppendableFile(name_, &append_vlog_);
+  if (!s.ok()) return s;
+
+  s = env_->NewRandomWriteFile(name_, &random_write_vlog_);
+  if (!s.ok()) return s;
+
+  s = env_->NewRandomAccessFile(name_, &random_read_vlog_);
+  return s;
+}
+
+void VLog::IncreaseOffset(const std::string& value) { offset_ += value.size(); }
 
 // total_size->value_size->value->key_size->key
 // fix32->fix32->char[]->fix32->char[]
-std::string vLog::EncodeEntry(const Slice& key, const Slice& value) {
+std::string VLog::EncodeEntry(const Slice& key, const Slice& value) {
   std::string result;
 
   std::string key_size, value_size;
@@ -52,11 +73,11 @@ std::string vLog::EncodeEntry(const Slice& key, const Slice& value) {
   return result;
 }
 
-Status vLog::DecodeEntry(uint64_t offset, std::string* key,
+Status VLog::DecodeEntry(uint64_t offset, std::string* key,
                          std::string* value) {
   Slice total;
   char buffer[sizeof(uint32_t)];
-  Status s = read_vlog_->Read(offset, sizeof(uint32_t), &total, buffer);
+  Status s = random_read_vlog_->Read(offset, sizeof(uint32_t), &total, buffer);
   if (!s.ok()) return s;
 
   uint32_t index = sizeof(uint32_t);
@@ -65,7 +86,7 @@ Status vLog::DecodeEntry(uint64_t offset, std::string* key,
   Slice entry;
   char entry_buffer[total_size];
 
-  s = read_vlog_->Read(offset + index, total_size, &entry, entry_buffer);
+  s = random_read_vlog_->Read(offset + index, total_size, &entry, entry_buffer);
   if (!s.ok()) return s;
 
   index = 0;
@@ -80,60 +101,70 @@ Status vLog::DecodeEntry(uint64_t offset, std::string* key,
   return s;
 }
 
-void vLog::Add(const Slice& key, const Slice& value) {
-  buffer_ = EncodeEntry(key, value);
+void VLog::Add(const Slice& key, const Slice& value) {
+  buffer_ += EncodeEntry(key, value);
   offset_ += buffer_.size();
 }
 
-std::string vLog::Name() const { return name_; }
+std::string VLog::Name() const { return name_; }
 
-void vLog::Finish() {
-  if (write_vlog_ == nullptr) {
-    Status s = env_->NewWritableFile(name_, &write_vlog_);
-    if (!s.ok()) return;
-  }
-
-  Status s = write_vlog_->Append(buffer_.data());
+Status VLog::Finish() {
+  Status s = append_vlog_->Append(
+      buffer_);  //不能写成buffer.data()
+                 //这里由于构造Slice采用strlen判断大小导致后面都截断
   if (!s.ok()) {
-    return;
+    return s;
   }
-  write_vlog_->Sync();
-  head_ += buffer_.size();
+  s = append_vlog_->Sync();
+  if (s.ok()) {
+    head_ += buffer_.size();
+  }
+
+  Log(options_->info_log, "VLog write buffer size %ld", buffer_.size());
+
   buffer_.clear();
+
+  return s;
 }
 
-size_t vLog::CurrentSize() const { return offset_; }
+size_t VLog::CurrentSize() const { return offset_; }
 
-Status vLog::Get(uint64_t offset, std::string* value) {
-  if (write_vlog_ == nullptr) return Status::Corruption("No data");
+Status VLog::Get(uint64_t offset, std::string* value) {
+  if (random_write_vlog_ == nullptr) return Status::Corruption("No data");
+
   std::string key;
   return DecodeEntry(offset, &key, value);
 }
 
-Status vLog::ParseKeyAndValue(uint64_t offset, const Slice& from,
+Status VLog::ParseKeyAndValue(uint64_t* offset, const Slice& from,
                               std::string* key) {
   uint32_t total_size = DecodeFixed32(from.data());
+
+  *offset += sizeof(uint32_t);  // +total_size
+
   char buffer[total_size];
   Slice entry;
-  Status s =
-      read_vlog_->Read(offset + sizeof(uint32_t), total_size, &entry, buffer);
+  Status s = random_read_vlog_->Read(*offset, total_size, &entry, buffer);
 
   if (!s.ok()) return s;
 
   uint32_t value_size = DecodeFixed32(entry.data());
+
   uint32_t key_size =
       DecodeFixed32(entry.data() + sizeof(uint32_t) + value_size);
 
   *key =
       std::string(entry.data() + 2 * sizeof(uint32_t) + value_size, key_size);
+
+  *offset += sizeof(uint32_t);
+  *offset += value_size;
+  *offset += sizeof(uint32_t);
+  *offset += key_size;
+
   return s;
 }
 
-Status vLog::ReInsertInVLog(const Slice& key, const Slice& value) {
-  if (random_write_vlog_ == nullptr) {
-    Status s = env_->NewRandomWriteFile(name_, &random_write_vlog_);
-    if (!s.ok()) return s;
-  }
+Status VLog::ReInsertInVLog(const Slice& key, const Slice& value) {
   std::string entry = EncodeEntry(key, value);
   Status s = random_write_vlog_->Write(entry, entry.size(), head_);
   if (!s.ok()) return s;
@@ -143,24 +174,22 @@ Status vLog::ReInsertInVLog(const Slice& key, const Slice& value) {
   return s;
 }
 
-Status vLog::StartGC() {
-  if (read_vlog_ == nullptr) {
-    Status s = env_->NewRandomAccessFile(name_, &read_vlog_);
-    if (!s.ok()) return s;
-  }
-
+Status VLog::StartGC() {
   uint64_t parse_offset = tail_;
+  uint64_t last_tail = tail_;
   uint64_t last_head = head_;
   Status s;
-  constexpr int size = sizeof(uint64_t);
-  char buffer[size] = {'\0'};
+  constexpr int total_size = sizeof(uint32_t);
+  char buffer[total_size] = {'\0'};
 
-  while (parse_offset <= last_head) {
+  while (parse_offset < last_head) {
     Slice result;
-    s = read_vlog_->Read(parse_offset, sizeof(uint64_t), &result, buffer);
+    s = random_read_vlog_->Read(parse_offset, sizeof(uint32_t), &result,
+                                buffer);
     if (!s.ok()) return s;
+
     std::string key;
-    s = ParseKeyAndValue(parse_offset, result, &key);
+    s = ParseKeyAndValue(&parse_offset, result, &key);
     if (!s.ok()) return s;
 
     std::string value;
@@ -172,14 +201,21 @@ Status vLog::StartGC() {
       if (!s.ok()) return s;
     }
   }
+
   s = random_write_vlog_->Fallocate(tail_, last_head - tail_);
   if (!s.ok()) return s;
   tail_ = last_head;
+
+  Log(options_->info_log,
+      "Last Valid Interval[%ld:%ld],Now Valid Interval[%ld:%ld]", last_tail,
+      last_head, tail_, head_);
+
   return s;
 }
 
-Status vLog::ParseValidInterval() {
-  std::string interval_file_name = vLogValidIntervalFileName(db_->GetName());
+Status VLog::ParseValidInterval() {
+  std::string interval_file_name =
+      vLogValidIntervalFileName(reinterpret_cast<DBImpl*>(db_)->GetName());
 
   if (persistence_read_ == nullptr) {
     Status s = env_->NewSequentialFile(interval_file_name, &persistence_read_);
@@ -198,8 +234,9 @@ Status vLog::ParseValidInterval() {
   return s;
 }
 
-Status vLog::PersistenceInterval() {
-  std::string interval_file_name = vLogValidIntervalFileName(db_->GetName());
+Status VLog::PersistenceInterval() {
+  std::string interval_file_name =
+      vLogValidIntervalFileName(reinterpret_cast<DBImpl*>(db_)->GetName());
 
   bool first_persistence = (persistence_write_ == nullptr) ? true : false;
 
@@ -229,8 +266,6 @@ Status vLog::PersistenceInterval() {
     Status s = env_->RenameFile(file_name, interval_file_name);
     if (!s.ok()) return s;
   }
-
-  fprintf(stderr, "Persistence Valid Interval [%ld->%ld]", tail_, head_);
 
   return s;
 }

@@ -23,6 +23,8 @@ Iterator::~Iterator() {
   }
 }
 
+Iterator* Iterator::current() const { return nullptr; }
+
 void Iterator::RegisterCleanup(CleanupFunction func, void* arg1, void* arg2) {
   assert(func != nullptr);
   CleanupNode* node;

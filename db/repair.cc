@@ -205,7 +205,7 @@ class Repairer {
     meta.number = next_file_number_++;
 
     // TODO
-    vLog* vlog = nullptr;
+    VLog* vlog = nullptr;
 
     Iterator* iter = mem->NewIterator();
     status =

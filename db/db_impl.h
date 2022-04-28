@@ -18,7 +18,6 @@
 
 #include "port/port.h"
 #include "port/thread_annotations.h"
-#include "table/vlog_format.h"
 
 namespace leveldb {
 
@@ -27,6 +26,8 @@ class TableCache;
 class Version;
 class VersionEdit;
 class VersionSet;
+class VLog;
+class Prefetcher;
 
 class DBImpl : public DB {
  public:
@@ -44,6 +45,8 @@ class DBImpl : public DB {
   Status Write(const WriteOptions& options, WriteBatch* updates) override;
   Status Get(const ReadOptions& options, const Slice& key,
              std::string* value) override;
+  Status ScanCountOfValue(const ReadOptions&, const Slice& start,
+                          uint32_t count, std::vector<std::string>* result);
   Iterator* NewIterator(const ReadOptions&) override;
   const Snapshot* GetSnapshot() override;
   void ReleaseSnapshot(const Snapshot* snapshot) override;
@@ -73,9 +76,11 @@ class DBImpl : public DB {
   // bytes.
   void RecordReadSample(Slice key);
 
-  std::string GetName() const override;
+  std::string GetName() const;
 
-  Status StartGC() override;
+  Status StartGC();
+
+  VLog* GetVLog();
 
  private:
   friend class DB;
@@ -203,14 +208,17 @@ class DBImpl : public DB {
 
   ManualCompaction* manual_compaction_ GUARDED_BY(mutex_);
 
+  std::unique_ptr<VLog> vlog_ GUARDED_BY(mutex_);
+
   VersionSet* const versions_ GUARDED_BY(mutex_);
+
+  std::unique_ptr<Prefetcher> prefetcher_
+      GUARDED_BY(mutex_);  //必须在versionset前析构 需要清除所有iter
 
   // Have we encountered a background error in paranoid mode?
   Status bg_error_ GUARDED_BY(mutex_);
 
   CompactionStats stats_[config::kNumLevels] GUARDED_BY(mutex_);
-
-  std::unique_ptr<vLog> vlog_;
 };
 
 // Sanitize db options.  The caller should delete result.info_log if

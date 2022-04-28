@@ -19,7 +19,7 @@ namespace leveldb {
 
 Status BuildTable(const std::string& dbname, Env* env, const Options& options,
                   TableCache* table_cache, Iterator* iter, FileMetaData* meta,
-                  vLog* vlog) {
+                  VLog* vlog) {
   Status s;
   meta->file_size = 0;
   iter->SeekToFirst();
@@ -41,11 +41,11 @@ Status BuildTable(const std::string& dbname, Env* env, const Options& options,
       key = iter->key();
       std::string offset;
       PutFixed64(&offset, static_cast<uint64_t>(vlog->CurrentSize()));
+      Log(options.info_log, "offset %ld",
+          static_cast<uint64_t>(vlog->CurrentSize()));
       builder->Add(key, offset);  // value为与key对应value在vLOG中offset
-      Log(options.info_log, "Key[%s:%ld] Value[%s:%ld] offset %ld",
-          key.ToString(), key.size(), iter->value().ToString(),
-          iter->value().size(), static_cast<uint64_t>(vlog->CurrentSize()));
-
+      /*    Log(options.info_log, "key_size %ld value_size %ld ", key.size(),
+              iter->value().size());*/
       vlog->Add(key, iter->value());
     }
     if (!key.empty()) {
@@ -63,11 +63,15 @@ Status BuildTable(const std::string& dbname, Env* env, const Options& options,
     // Finish and check for file errors
     if (s.ok()) {
       s = file->Sync();
-      vlog->Finish();
     }
     if (s.ok()) {
       s = file->Close();
     }
+
+    if (s.ok()) {
+      s = vlog->Finish();
+    }
+
     delete file;
     file = nullptr;
 

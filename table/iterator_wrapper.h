@@ -74,6 +74,8 @@ class IteratorWrapper {
     Update();
   }
 
+  Iterator* current() { return iter_; }
+
  private:
   void Update() {
     valid_ = iter_->Valid();

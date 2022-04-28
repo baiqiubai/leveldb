@@ -58,8 +58,6 @@ Status WriteBatch::Iterate(Handler* handler) const {
       case kTypeValue:
         if (GetLengthPrefixedSlice(&input, &key) &&
             GetLengthPrefixedSlice(&input, &value)) {
-          fprintf(stderr, "key_size %ld,value_size %ld\n", key.size(),
-                  value.size());
           handler->Put(key, value);
         } else {
           return Status::Corruption("bad WriteBatch Put");

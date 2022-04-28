@@ -85,6 +85,31 @@ class MemTable {
   Table table_;
 };
 
+class MemTableIterator : public Iterator {
+ public:
+  explicit MemTableIterator(MemTable::Table* table) : iter_(table) {}
+
+  MemTableIterator(const MemTableIterator&) = delete;
+  MemTableIterator& operator=(const MemTableIterator&) = delete;
+
+  ~MemTableIterator() override = default;
+
+  bool Valid() const override;
+  void Seek(const Slice& k) override;
+  void SeekToFirst() override;
+  void SeekToLast() override;
+  void Next() override;
+  void Prev() override;
+  Slice key() const override;
+  Slice value() const override;
+
+  Status status() const override;
+
+ private:
+  MemTable::Table::Iterator iter_;
+  std::string tmp_;  // For passing to EncodeKey
+};
+
 }  // namespace leveldb
 
 #endif  // STORAGE_LEVELDB_DB_MEMTABLE_H_

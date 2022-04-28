@@ -1,20 +1,30 @@
+
+
+#ifndef STORAGE_LEVELDB_TABLE_VLOG_FORMAT_H_
+#define STORAGE_LEVELDB_TABLE_VLOG_FORMAT_H_
+
 #include <memory>
 
-#include "leveldb/slice.h"
-
-#include "util/coding.h"
-
-#include "include/leveldb/db.h"
-#include "include/leveldb/env.h"
+#include "include/leveldb/status.h"
 
 namespace leveldb {
-class vLog {
+
+class DB;
+class Options;
+class Env;
+class Slice;
+class WritableFile;
+class RandomAccessFile;
+class RandomWriteFile;
+class SequentialFile;
+
+class VLog {
  public:
-  explicit vLog(DB* db, const Options* options, Env* env,
+  explicit VLog(DB* db, const Options* options, Env* env,
                 const std::string& vlog_name);
 
-  vLog(const vLog&) = delete;
-  vLog& operator=(const vLog&) = delete;
+  VLog(const VLog&) = delete;
+  VLog& operator=(const VLog&) = delete;
 
   void Add(const Slice& key, const Slice& value);
 
@@ -24,7 +34,7 @@ class vLog {
 
   uint64_t Head() const { return head_; }
 
-  void Finish();
+  Status Finish();
 
   size_t CurrentSize() const;
 
@@ -36,12 +46,13 @@ class vLog {
 
   Status PersistenceInterval();
 
-  ~vLog();
+  ~VLog();
 
  private:
   void IncreaseOffset(const std::string& value);
 
-  Status ParseKeyAndValue(uint64_t offset, const Slice& from, std::string* key);
+  Status ParseKeyAndValue(uint64_t* offset, const Slice& from,
+                          std::string* key);
 
   Status ReInsertInVLog(const Slice& key, const Slice& value);
 
@@ -49,17 +60,19 @@ class vLog {
 
   Status DecodeEntry(uint64_t offset, std::string* key, std::string* value);
 
+  Status InitAllFile();
+
   DB* db_;  // search in lsm-tree
   const Options* options_;
   Env* env_;
 
   std::string name_;
 
-  WritableFile* write_vlog_;
-  RandomAccessFile* read_vlog_;
+  WritableFile* append_vlog_;
+  RandomAccessFile* random_read_vlog_;
   RandomWriteFile* random_write_vlog_;
 
-  WritableFile* persistence_write_;
+  WritableFile* persistence_write_;  //延迟打开
   SequentialFile* persistence_read_;
 
   std::string buffer_;
@@ -69,3 +82,5 @@ class vLog {
   uint64_t head_;
 };
 }  // namespace leveldb
+
+#endif
