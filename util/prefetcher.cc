@@ -32,20 +32,24 @@ Status Prefetcher::Fetch(const ReadOptions& options, const Slice& start,
   }
 
   result->resize(count);
+  thread_pool_->SetTaskNum(count);
   int32_t i = 0;
 
   iter_->Seek(start);
   for (; iter_->Valid() && count--; iter_->Next()) {
     if (typeid(*iter_->current()) ==
-        typeid(MemTableIterator)) {  //运行期识别 如果是memtable没有kv分离
+        typeid(MemTableIterator)) {  //运行期识别 如果是memtable则没有kv分离
       (*result)[i] = iter_->value().ToString();
     } else {
       uint64_t offset = DecodeFixed64(iter_->value().data());
-      fprintf(stderr, "offset ---->%ld\n", offset);
       thread_pool_->AddTask(
           std::bind(&VLog::Get, vlog_, offset, &(*result)[i]));
     }
     ++i;
+  }
+
+  while (thread_pool_->GetRemainTaskNum()) {
+    ;
   }
   thread_pool_->Stop();
   return Status::OK();
