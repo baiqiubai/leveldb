@@ -30,9 +30,13 @@ class ThreadPool {
 
   void AddTask(ThreadPool::Task&& task);
 
+  void SetTaskNum(int task_num);
+
   void Stop();
 
   void Start();
+
+  int GetRemainTaskNum() const;
 
  private:
   void DoTask();
@@ -40,9 +44,13 @@ class ThreadPool {
   Task TakeTask();
 
   const int thread_num_;
+  std::atomic<int> task_num_;
+
   std::mutex mutex_;
   std::condition_variable cv_;
+
   std::atomic<bool> stop_;
+
   std::deque<Task> tasks_queue_;
   std::vector<std::unique_ptr<std::thread>> threads_;
 };

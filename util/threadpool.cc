@@ -12,7 +12,8 @@ long GetCPUCore() { return ::sysconf(_SC_NPROCESSORS_ONLN); }
 
 }  // namespace ThreadConfig
 
-ThreadPool::ThreadPool(int thread_num) : thread_num_(thread_num), stop_(true) {
+ThreadPool::ThreadPool(int thread_num)
+    : thread_num_(thread_num), task_num_(0), stop_(true) {
   threads_.reserve(thread_num_);
 }
 
@@ -41,11 +42,16 @@ void ThreadPool::AddTask(Task&& task) {
   cv_.notify_one();
 }
 
+void ThreadPool::SetTaskNum(int task_num) { task_num_ = task_num; }
+
+int ThreadPool::GetRemainTaskNum() const { return task_num_.load(); }
+
 void ThreadPool::DoTask() {
   while (!stop_) {
     Task task = TakeTask();
     if (task != nullptr) {
       Status s = task();
+      task_num_--;
       assert(s.ok());
     }
   }
@@ -57,7 +63,10 @@ ThreadPool::Task ThreadPool::TakeTask() {
     cv_.wait(lock);
   }
 
-  if (stop_) return nullptr;
+  //必须没有任务才能终止 否则导致有的线程没有运行则被stop
+  if (stop_ && task_num_ == 0) {
+    return nullptr;
+  }
 
   Task task = std::move(tasks_queue_.front());
   tasks_queue_.pop_front();
