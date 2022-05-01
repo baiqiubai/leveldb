@@ -36,7 +36,7 @@ class VLog {
 
   Status Finish();
 
-  size_t CurrentSize() const;
+  uint64_t CurrentSize() const;
 
   Status StartGC();
 
@@ -49,16 +49,18 @@ class VLog {
   ~VLog();
 
  private:
-  void IncreaseOffset(const std::string& value);
+  Status ParseEntrySize(uint64_t offset, uint32_t* result);
 
-  Status ParseKeyAndValue(uint64_t* offset, const Slice& from,
-                          std::string* key);
+  void ParseValueOrKey(std::string* result, const Slice& key, uint32_t* index);
 
   Status ReInsertInVLog(const Slice& key, const Slice& value);
 
   std::string EncodeEntry(const Slice& key, const Slice& value);
 
   Status DecodeEntry(uint64_t offset, std::string* key, std::string* value);
+
+  Status GetEntry(uint64_t offset, char* scratch, uint32_t entry_size,
+                  Slice* result);
 
   Status InitAllFile();
 
@@ -77,7 +79,7 @@ class VLog {
 
   std::string buffer_;
 
-  size_t offset_;
+  uint64_t offset_;
   uint64_t tail_;
   uint64_t head_;
 };
