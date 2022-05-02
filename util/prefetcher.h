@@ -22,10 +22,15 @@ class Prefetcher {
 
   ~Prefetcher();
 
+  Status Fetch(const ReadOptions&, const Slice& start, const Slice& end,
+               std::vector<std::string>* result);
+
   Status Fetch(const ReadOptions&, const Slice& start, uint32_t count,
                std::vector<std::string>* result);
 
  private:
+  void LazyNewIterator(const ReadOptions& options);
+
   DB* db_;
   VLog* vlog_;
   Iterator* iter_;

@@ -25,20 +25,75 @@ Prefetcher::~Prefetcher() {
   delete iter_;  //必须手动delete
 }
 
-Status Prefetcher::Fetch(const ReadOptions& options, const Slice& start,
-                         uint32_t count, std::vector<std::string>* result) {
+void Prefetcher::LazyNewIterator(const ReadOptions& options) {
   if (iter_ == nullptr) {
     iter_ = db_->NewIterator(options);
   }
+}
 
+Status Prefetcher::Fetch(const ReadOptions& options, const Slice& start,
+                         const Slice& end, std::vector<std::string>* result) {
+  LazyNewIterator(options);
+
+  if (start.compare(Slice()) == 0) {
+    iter_->SeekToFirst();
+  } else {
+    iter_->Seek(start);
+  }
+
+  std::vector<std::future<std::string>> futures;
+
+  while (iter_->Valid()) {
+    bool is_memtable_iterator =
+        (typeid(*iter_->current()) == typeid(MemTableIterator)) ? true : false;
+
+    if (is_memtable_iterator) {
+      result->emplace_back(iter_->value().ToString());
+    } else {
+      uint64_t offset = DecodeFixed64(iter_->value().data());
+      std::promise<std::string> pro;
+      std::future<std::string> fu = pro.get_future();
+      thread_pool_->AddTask(
+          std::bind(&VLog::GetUsePromise, vlog_, offset, &pro));
+      futures.emplace_back(std::move(fu));
+    }
+
+    if (iter_->key().compare(end) == 0) break;
+
+    iter_->Next();
+  }
+
+  for (auto& it : futures) {
+    result->emplace_back(it.get());
+  }
+
+  while (!thread_pool_->AllTaskIsFinished()) {
+    ;
+  }
+
+  thread_pool_->Stop();
+
+  return Status::OK();
+}
+
+Status Prefetcher::Fetch(const ReadOptions& options, const Slice& start,
+                         uint32_t count, std::vector<std::string>* result) {
+  LazyNewIterator(options);
+
+  int32_t i = 0;
   result->resize(count);
   thread_pool_->SetTaskNum(count);
-  int32_t i = 0;
 
-  iter_->Seek(start);
+  if (start.compare(Slice()) == 0) {
+    iter_->SeekToFirst();
+  } else {
+    iter_->Seek(start);
+  }
+
   for (; iter_->Valid() && count--; iter_->Next()) {
-    if (typeid(*iter_->current()) ==
-        typeid(MemTableIterator)) {  //运行期识别 如果是memtable则没有kv分离
+    bool is_memtable_iterator =
+        (typeid(*iter_->current()) == typeid(MemTableIterator)) ? true : false;
+    if (is_memtable_iterator) {
       (*result)[i] = iter_->value().ToString();
     } else {
       uint64_t offset = DecodeFixed64(iter_->value().data());
@@ -51,7 +106,6 @@ Status Prefetcher::Fetch(const ReadOptions& options, const Slice& start,
   while (thread_pool_->GetRemainTaskNum()) {
     ;
   }
-  thread_pool_->Stop();
   return Status::OK();
 }
 
