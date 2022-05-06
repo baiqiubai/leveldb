@@ -23,7 +23,7 @@ class Prefetcher {
   ~Prefetcher();
 
   Status Fetch(const ReadOptions&, const Slice& start, const Slice& end,
-               std::vector<std::string>* result);
+               std::vector<std::string>* result, bool is_forward_scan);
 
   Status Fetch(const ReadOptions&, const Slice& start, uint32_t count,
                std::vector<std::string>* result);
@@ -42,6 +42,8 @@ class ParseIteratorValue {
   explicit ParseIteratorValue(VLog* vlog);
 
   ~ParseIteratorValue();
+
+  void Clear();
 
   std::string GetValue() const;
 

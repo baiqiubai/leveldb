@@ -37,6 +37,7 @@ void ThreadPool::Stop() {
 }
 
 void ThreadPool::AddTask(Task&& task) {
+  task_num_++;
   std::unique_lock<std::mutex> lock(mutex_);
   tasks_queue_.emplace_back(std::move(task));
   cv_.notify_one();
@@ -44,7 +45,7 @@ void ThreadPool::AddTask(Task&& task) {
 
 void ThreadPool::SetTaskNum(int task_num) { task_num_ = task_num; }
 
-int ThreadPool::GetRemainTaskNum() const { return task_num_.load(); }
+bool ThreadPool::AllTaskIsFinished() const { return task_num_.load() == 0; }
 
 void ThreadPool::DoTask() {
   while (!stop_) {
@@ -63,8 +64,7 @@ ThreadPool::Task ThreadPool::TakeTask() {
     cv_.wait(lock);
   }
 
-  //必须没有任务才能终止 否则导致有的线程没有运行则被stop
-  if (stop_ && task_num_ == 0) {
+  if (stop_ || tasks_queue_.empty()) {
     return nullptr;
   }
 

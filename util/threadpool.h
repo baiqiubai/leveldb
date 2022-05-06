@@ -36,7 +36,7 @@ class ThreadPool {
 
   void Start();
 
-  int GetRemainTaskNum() const;
+  bool AllTaskIsFinished() const;
 
  private:
   void DoTask();
@@ -46,7 +46,7 @@ class ThreadPool {
   const int thread_num_;
   std::atomic<int> task_num_;
 
-  std::mutex mutex_;
+  mutable std::mutex mutex_;
   std::condition_variable cv_;
 
   std::atomic<bool> stop_;

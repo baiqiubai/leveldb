@@ -1,6 +1,7 @@
 #include "util/prefetcher.h"
 
 #include "db/memtable.h"
+#include <memory>
 #include <typeinfo>
 
 #include "table/vlog_format.h"
@@ -21,7 +22,7 @@ Prefetcher::Prefetcher(DB* db, VLog* vlog)
 }
 
 Prefetcher::~Prefetcher() {
-  // thread_pool_->Stop();
+  thread_pool_->Stop();
   delete iter_;  //必须手动delete
 }
 
@@ -32,16 +33,23 @@ void Prefetcher::LazyNewIterator(const ReadOptions& options) {
 }
 
 Status Prefetcher::Fetch(const ReadOptions& options, const Slice& start,
-                         const Slice& end, std::vector<std::string>* result) {
+                         const Slice& end, std::vector<std::string>* result,
+                         bool is_forward_scan) {
   LazyNewIterator(options);
 
   if (start.compare(Slice()) == 0) {
-    iter_->SeekToFirst();
+    if (is_forward_scan) {
+      iter_->SeekToFirst();
+    } else {
+      iter_->SeekToLast();
+    }
   } else {
     iter_->Seek(start);
   }
 
   std::vector<std::future<std::string>> futures;
+  std::vector<std::shared_ptr<std::promise<std::string>>> protect_promises;
+  //此处利用shared_ptr保护promise不被析构
 
   while (iter_->Valid()) {
     bool is_memtable_iterator =
@@ -51,27 +59,31 @@ Status Prefetcher::Fetch(const ReadOptions& options, const Slice& start,
       result->emplace_back(iter_->value().ToString());
     } else {
       uint64_t offset = DecodeFixed64(iter_->value().data());
-      std::promise<std::string> pro;
-      std::future<std::string> fu = pro.get_future();
+      std::shared_ptr<std::promise<std::string>> pro(
+          std::make_shared<std::promise<std::string>>());
+      protect_promises.emplace_back(pro);
+      std::future<std::string> fu = pro->get_future();
       thread_pool_->AddTask(
-          std::bind(&VLog::GetUsePromise, vlog_, offset, &pro));
+          std::bind(&VLog::GetUsePromise, vlog_, offset, pro.get()));
       futures.emplace_back(std::move(fu));
     }
 
     if (iter_->key().compare(end) == 0) break;
 
-    iter_->Next();
-  }
-
-  for (auto& it : futures) {
-    result->emplace_back(it.get());
+    if (is_forward_scan) {
+      iter_->Next();
+    } else {
+      iter_->Prev();
+    }
   }
 
   while (!thread_pool_->AllTaskIsFinished()) {
     ;
   }
 
-  thread_pool_->Stop();
+  for (auto& it : futures) {
+    result->emplace_back(it.get());
+  }
 
   return Status::OK();
 }
@@ -103,7 +115,7 @@ Status Prefetcher::Fetch(const ReadOptions& options, const Slice& start,
     ++i;
   }
 
-  while (thread_pool_->GetRemainTaskNum()) {
+  while (!thread_pool_->AllTaskIsFinished()) {
     ;
   }
   return Status::OK();
@@ -113,8 +125,10 @@ ParseIteratorValue::ParseIteratorValue(VLog* vlog) : vlog_(vlog) {}
 
 ParseIteratorValue::~ParseIteratorValue() {
   vlog_ = nullptr;
-  to_value_.clear();
+  Clear();
 }
+
+void ParseIteratorValue::Clear() { to_value_.clear(); }
 
 Status ParseIteratorValue::Parse(const Slice& from_value) {
   uint64_t offset = DecodeFixed64(from_value.data());
