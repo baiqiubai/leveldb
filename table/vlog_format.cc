@@ -237,7 +237,7 @@ Status VLog::StartGC() {
     std::string no_sequence_key = parse_key.user_key.ToString();
 
     s = db_->Get(ReadOptions(), no_sequence_key, &value);  //去掉sequence
-
+    // TODO 需要重新插入lsm-tree 调整offset
     if (!s.ok()) {
       need_reinsert = false;  //需要舍弃
     }
