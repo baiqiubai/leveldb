@@ -153,7 +153,8 @@ DBImpl::DBImpl(const Options& raw_options, const std::string& dbname)
       vlog_(new VLog(this, &options_, env_, vLogFileName(dbname_))),
       versions_(new VersionSet(dbname_, &options_, table_cache_,
                                &internal_comparator_, vlog_.get())),
-      prefetcher_(new Prefetcher(this, vlog_.get())) {}
+      prefetcher_(new Prefetcher(this, vlog_.get())),
+      has_major_compact_(false) {}
 
 DBImpl::~DBImpl() {
   // Wait for background work to finish.
@@ -167,8 +168,8 @@ DBImpl::~DBImpl() {
   if (db_lock_ != nullptr) {
     env_->UnlockFile(db_lock_);
   }
-
-  prefetcher_.reset();  //必须reset??不知道为什么..明明按照声明顺序反向析构的
+  vlog_.reset();
+  prefetcher_.reset();  //必须显示reset
 
   delete versions_;
   if (mem_ != nullptr) mem_->Unref();
@@ -201,6 +202,23 @@ Status DBImpl::ScanCountOfValue(const ReadOptions& options, const Slice& start,
                                 uint32_t count,
                                 std::vector<std::string>* result) {
   return prefetcher_->Fetch(options, start, count, result);
+}
+
+Status DBImpl::BackwardScan(const ReadOptions& options, const Slice& start,
+                            const Slice& end,
+                            std::vector<std::string>* result) {
+  return Scan(options, start, end, result, false);
+}
+
+Status DBImpl::ForwardScan(const ReadOptions& options, const Slice& start,
+                           const Slice& end, std::vector<std::string>* result) {
+  return Scan(options, start, end, result);
+}
+
+Status DBImpl::Scan(const ReadOptions& options, const Slice& start,
+                    const Slice& end, std::vector<std::string>* result,
+                    bool is_forward_scan) {
+  return prefetcher_->Fetch(options, start, end, result, is_forward_scan);
 }
 
 Status DBImpl::NewDB() {
@@ -740,6 +758,15 @@ void DBImpl::BackgroundCall() {
   // Previous compaction may have produced too many files in a level,
   // so reschedule another compaction if needed.
   MaybeScheduleCompaction();
+  if (has_major_compact_) {
+    mutex_.Unlock();
+    Status s = vlog_->StartGC();
+    if (!s.ok()) {
+      Log(options_.info_log, "VLog GC error:%s\n", s.ToString().c_str());
+    }
+    mutex_.Lock();
+    has_major_compact_ = false;
+  }
   background_work_finished_signal_.SignalAll();
 }
 
@@ -789,6 +816,7 @@ void DBImpl::BackgroundCompaction() {
         static_cast<unsigned long long>(f->number), c->level() + 1,
         static_cast<unsigned long long>(f->file_size),
         status.ToString().c_str(), versions_->LevelSummary(&tmp));
+    has_major_compact_ = true;
   } else {
     CompactionState* compact = new CompactionState(c);
     status = DoCompactionWork(compact);
@@ -798,6 +826,7 @@ void DBImpl::BackgroundCompaction() {
     CleanupCompaction(compact);
     c->ReleaseInputs();
     RemoveObsoleteFiles();
+    has_major_compact_ = true;
   }
   delete c;
 
@@ -1166,6 +1195,7 @@ Status DBImpl::Get(const ReadOptions& options, const Slice& key,
   } else {
     snapshot = versions_->LastSequence();
   }
+  fprintf(stderr, "need key %s,sequence %ld\n", key.data(), snapshot);
 
   MemTable* mem = mem_;
   MemTable* imm = imm_;
@@ -1389,8 +1419,6 @@ Status DBImpl::MakeRoomForWrite(bool force) {
       mutex_.Lock();
     } else if (!force &&
                (mem_->ApproximateMemoryUsage() <= options_.write_buffer_size)) {
-      /* Log(options_.info_log, "MemTable MemoryUsage %ld",
-           mem_->ApproximateMemoryUsage());*/
       // There is room in current memtable
       break;
     } else if (imm_ != nullptr) {
