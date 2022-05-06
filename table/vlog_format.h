@@ -3,6 +3,7 @@
 #ifndef STORAGE_LEVELDB_TABLE_VLOG_FORMAT_H_
 #define STORAGE_LEVELDB_TABLE_VLOG_FORMAT_H_
 
+#include <future>
 #include <memory>
 
 #include "include/leveldb/status.h"
@@ -30,6 +31,8 @@ class VLog {
 
   Status Get(uint64_t offset, std::string* value);
 
+  Status GetUsePromise(uint64_t offset, std::promise<std::string>* value);
+
   uint64_t Tail() const { return tail_; }
 
   uint64_t Head() const { return head_; }
@@ -53,7 +56,8 @@ class VLog {
 
   void ParseValueOrKey(std::string* result, const Slice& key, uint32_t* index);
 
-  Status ReInsertInVLog(const Slice& key, const Slice& value);
+  Status ReInsertInVLog(const Slice& key, const Slice& value,
+                        uint64_t* new_head);
 
   std::string EncodeEntry(const Slice& key, const Slice& value);
 
@@ -82,6 +86,8 @@ class VLog {
   uint64_t offset_;
   uint64_t tail_;
   uint64_t head_;
+
+  char entry_buffer_[4096];  //优化
 };
 }  // namespace leveldb
 

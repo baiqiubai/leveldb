@@ -26,7 +26,9 @@ VLog::VLog(DB* db, const Options* options, Env* env,
       tail_(0),
       head_(0) {
   Status s = InitAllFile();
-  assert(s.ok());
+  if (!s.ok()) {
+    Log(options_->info_log, "Init Vlog file error %s", s.ToString().data());
+  }
 }
 
 VLog::~VLog() {
@@ -41,10 +43,14 @@ VLog::~VLog() {
 Status VLog::InitAllFile() {
   Status s;
   s = env_->NewAppendableFile(name_, &append_vlog_);
-  if (!s.ok()) return s;
+  if (!s.ok()) {
+    return s;
+  }
 
   s = env_->NewRandomWriteFile(name_, &random_write_vlog_);
-  if (!s.ok()) return s;
+  if (!s.ok()) {
+    return s;
+  }
 
   s = env_->NewRandomAccessFile(name_, &random_read_vlog_);
   return s;
@@ -110,15 +116,30 @@ Status VLog::DecodeEntry(uint64_t offset, std::string* key,
   uint32_t index = sizeof(uint32_t);
   offset += index;
 
-  char buffer[entry_size];
-  s = GetEntry(offset, buffer, entry_size, &entry);
+  char* buffer = nullptr;
+  bool use_stack = true;
+
+  if (entry_size < 4096) {
+    s = GetEntry(offset, entry_buffer_, entry_size, &entry);
+
+  } else {
+    char* buffer = new char[entry_size];
+    s = GetEntry(offset, buffer, entry_size, &entry);
+    use_stack = false;
+  }
+
   if (!s.ok()) {
-    return s;
+    goto out;
   }
 
   index = 0;
   ParseValueOrKey(value, entry, &index);
   ParseValueOrKey(key, entry, &index);
+
+out:
+  if (!use_stack) {
+    delete buffer;
+  }
   return s;
 }
 
@@ -148,7 +169,7 @@ Status VLog::Finish() {
     head_ += static_cast<uint64_t>(buffer_.size());
   }
 
-  Log(options_->info_log, "VLog write buffer size %ld", buffer_.size());
+  Log(options_->info_log, "[tail:%ld->head:%ld]", tail_, head_);
 
   buffer_.clear();
 
@@ -162,23 +183,40 @@ Status VLog::Get(uint64_t offset, std::string* value) {
   return DecodeEntry(offset, &key, value);
 }
 
-Status VLog::ReInsertInVLog(const Slice& key, const Slice& value) {
+Status VLog::GetUsePromise(uint64_t offset, std::promise<std::string>* value) {
+  std::string temp_value;
+  std::string key;
+  Status s = DecodeEntry(offset, &key, &temp_value);
+  value->set_value(std::move(temp_value));
+  return s;
+}
+
+Status VLog::ReInsertInVLog(const Slice& key, const Slice& value,
+                            uint64_t* new_head) {
   std::string entry = EncodeEntry(key, value);
-  Status s = random_write_vlog_->Write(entry, entry.size(), head_);
+  Status s = random_write_vlog_->Write(entry, entry.size(), *new_head);
   if (!s.ok()) {
     return s;
   }
 
-  random_write_vlog_->Sync();
-  head_ += static_cast<uint64_t>(entry.size());
+  s = random_write_vlog_->Sync();
+  if (s.ok()) {
+    *new_head += static_cast<uint64_t>(entry.size());
+  }
   return s;
 }
 
 Status VLog::StartGC() {
+  if (tail_ == head_) return Status::OK();
+
   uint64_t parse_offset = tail_;
   uint64_t last_tail = tail_;
   uint64_t last_head = head_;
+  uint64_t new_head = head_;
   Status s;
+
+  Log(options_->info_log, "Start GC [tail:%ld->head:%ld]", last_tail,
+      last_head);
 
   while (parse_offset < last_head) {
     std::string key;
@@ -189,19 +227,35 @@ Status VLog::StartGC() {
       return s;
     }
 
-    std::string value;
-    // find in lsm-tree
-    s = db_->Get(ReadOptions(), key, &value);
-    if (!s.ok()) {
-      return s;
+    ParsedInternalKey parse_key;
+    if (!ParseInternalKey(key, &parse_key)) {
+      return Status::Corruption("ParseInternalKey key:%s error", key.data());
     }
 
-    std::string new_offset;
-    PutFixed64(&new_offset, head_);
-    s = ReInsertInVLog(key, value);
+    std::string value;
+    bool need_reinsert = true;
+    std::string no_sequence_key = parse_key.user_key.ToString();
+
+    s = db_->Get(ReadOptions(), no_sequence_key, &value);  //去掉sequence
+
     if (!s.ok()) {
-      return s;
+      need_reinsert = false;  //需要舍弃
     }
+
+    Log(options_->info_log, "Key:%s Parse offset %ld finished,need_reinsert %s",
+        key.data(), parse_offset, need_reinsert ? "true" : "false");
+
+    if (need_reinsert) {
+      std::string new_offset;
+      PutFixed64(&new_offset, new_head);
+      s = ReInsertInVLog(key, value, &new_head);
+      if (!s.ok()) {
+        return s;
+      }
+    }
+    parse_offset += sizeof(uint32_t) * 3;
+    parse_offset += static_cast<uint64_t>(key.size());
+    parse_offset += static_cast<uint64_t>(value_offset.size());
   }
 
   s = random_write_vlog_->Fallocate(tail_, last_head - tail_);
@@ -209,6 +263,7 @@ Status VLog::StartGC() {
     return s;
   }
   tail_ = last_head;
+  head_ = new_head;
 
   Log(options_->info_log,
       "Last Valid Interval[%ld:%ld],Now Valid Interval[%ld:%ld]", last_tail,
@@ -238,6 +293,7 @@ Status VLog::ParseValidInterval() {
 
   tail_ = DecodeFixed64(result.data());
   head_ = DecodeFixed64(result.data() + sizeof(uint64_t));
+  offset_ = head_;
 
   Log(options_->info_log, "Valid Interval [%ld->%ld]", tail_, head_);
 
