@@ -12,6 +12,7 @@
 #include <deque>
 #include <set>
 #include <string>
+#include <thread>
 
 #include "leveldb/db.h"
 #include "leveldb/env.h"
@@ -21,6 +22,10 @@
 
 namespace leveldb {
 
+namespace detail {
+pid_t gettid();
+
+}  // namespace detail
 class MemTable;
 class TableCache;
 class Version;
@@ -28,6 +33,7 @@ class VersionEdit;
 class VersionSet;
 class VLog;
 class Prefetcher;
+class FileMetaData;
 
 class DBImpl : public DB {
  public:
@@ -46,7 +52,16 @@ class DBImpl : public DB {
   Status Get(const ReadOptions& options, const Slice& key,
              std::string* value) override;
   Status ScanCountOfValue(const ReadOptions&, const Slice& start,
-                          uint32_t count, std::vector<std::string>* result);
+                          uint32_t count,
+                          std::vector<std::string>* result) override;
+  Status ScanCountOfKV(
+      const ReadOptions&, const Slice& start, uint32_t count,
+      std::vector<std::pair<std::string, std::string>>* result) override;
+
+  Status ForwardScan(const ReadOptions&, const Slice& start, const Slice& end,
+                     std::vector<std::string>* result) override;
+  Status BackwardScan(const ReadOptions&, const Slice& start, const Slice& end,
+                      std::vector<std::string>* result) override;
   Iterator* NewIterator(const ReadOptions&) override;
   const Snapshot* GetSnapshot() override;
   void ReleaseSnapshot(const Snapshot* snapshot) override;
@@ -81,6 +96,12 @@ class DBImpl : public DB {
   Status StartGC();
 
   VLog* GetVLog();
+
+  void CompactEntryList(
+      const std::vector<std::pair<std::string, std::string>>& lists);
+
+  void AddSequenceNumberInKeys(
+      std::vector<std::pair<std::string, std::string>>* lists);
 
  private:
   friend class DB;
@@ -118,6 +139,14 @@ class DBImpl : public DB {
 
   Status NewDB();
 
+  Status Scan(const ReadOptions&, const Slice& start, const Slice& end,
+              std::vector<std::string>* result, bool is_forward_scan = true);
+
+  Status HelperScanCountOfKV(
+      const ReadOptions&, const Slice& start, uint32_t count,
+      std::vector<std::string>* values, bool get_kv = false,
+      std::vector<std::pair<std::string, std::string>>* result = nullptr);
+
   // Recover the descriptor from persistent storage.  May do a significant
   // amount of work to recover recently logged updates.  Any changes to
   // be made to the descriptor are added to *edit.
@@ -138,8 +167,11 @@ class DBImpl : public DB {
                         VersionEdit* edit, SequenceNumber* max_sequence)
       EXCLUSIVE_LOCKS_REQUIRED(mutex_);
 
-  Status WriteLevel0Table(MemTable* mem, VersionEdit* edit, Version* base)
-      EXCLUSIVE_LOCKS_REQUIRED(mutex_);
+  Status WriteLevel0Table(
+      MemTable* mem, VersionEdit* edit, Version* base,
+      const std::vector<std::pair<std::string, std::string>>& lists = {});
+
+  EXCLUSIVE_LOCKS_REQUIRED(mutex_);
 
   Status MakeRoomForWrite(bool force /* compact even if there is room? */)
       EXCLUSIVE_LOCKS_REQUIRED(mutex_);
@@ -149,6 +181,7 @@ class DBImpl : public DB {
   void RecordBackgroundError(const Status& s);
 
   void MaybeScheduleCompaction() EXCLUSIVE_LOCKS_REQUIRED(mutex_);
+  void MaybeScheduleGC() EXCLUSIVE_LOCKS_REQUIRED(mutex_);
   static void BGWork(void* db);
   void BackgroundCall();
   void BackgroundCompaction() EXCLUSIVE_LOCKS_REQUIRED(mutex_);
@@ -165,6 +198,8 @@ class DBImpl : public DB {
   const Comparator* user_comparator() const {
     return internal_comparator_.user_comparator();
   }
+
+  void PickLevel(VersionEdit* edit, Version* base, const FileMetaData& meta);
 
   // Constant after construction
   Env* const env_;
@@ -214,6 +249,8 @@ class DBImpl : public DB {
 
   std::unique_ptr<Prefetcher> prefetcher_
       GUARDED_BY(mutex_);  //必须在versionset前析构 需要清除所有iter
+
+  bool has_major_compact_ GUARDED_BY(mutex_);
 
   // Have we encountered a background error in paranoid mode?
   Status bg_error_ GUARDED_BY(mutex_);

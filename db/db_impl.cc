@@ -18,9 +18,12 @@
 #include <atomic>
 #include <cstdint>
 #include <cstdio>
+#include <functional>
 #include <iostream>
 #include <set>
 #include <string>
+#include <sys/syscall.h>
+#include <unistd.h>
 #include <vector>
 
 #include "leveldb/db.h"
@@ -40,6 +43,10 @@
 #include "util/prefetcher.h"
 
 namespace leveldb {
+
+namespace detail {
+pid_t gettid() { return ::syscall(SYS_gettid); }
+}  // namespace detail
 
 const int kNumNonTableCacheFiles = 10;
 
@@ -160,16 +167,18 @@ DBImpl::~DBImpl() {
   // Wait for background work to finish.
   mutex_.Lock();
   shutting_down_.store(true, std::memory_order_release);
+  Log(options_.info_log, "DB Destroy running...\n");
   while (background_compaction_scheduled_) {
     background_work_finished_signal_.Wait();
   }
   mutex_.Unlock();
+  Log(options_.info_log, "DB Destroy finished...\n");
 
   if (db_lock_ != nullptr) {
     env_->UnlockFile(db_lock_);
   }
   vlog_.reset();
-  prefetcher_.reset();  //必须显示reset
+  prefetcher_.reset();
 
   delete versions_;
   if (mem_ != nullptr) mem_->Unref();
@@ -201,7 +210,13 @@ VLog* DBImpl::GetVLog() { return vlog_.get(); }
 Status DBImpl::ScanCountOfValue(const ReadOptions& options, const Slice& start,
                                 uint32_t count,
                                 std::vector<std::string>* result) {
-  return prefetcher_->Fetch(options, start, count, result);
+  return prefetcher_->FetchOnlyValue(options, start, count, result);
+}
+
+Status DBImpl::ScanCountOfKV(
+    const ReadOptions& options, const Slice& start, uint32_t count,
+    std::vector<std::pair<std::string, std::string>>* result) {
+  return prefetcher_->FetchKV(options, start, count, result);
 }
 
 Status DBImpl::BackwardScan(const ReadOptions& options, const Slice& start,
@@ -321,8 +336,8 @@ void DBImpl::RemoveObsoleteFiles() {
         if (type == kTableFile) {
           table_cache_->Evict(number);
         }
-        Log(options_.info_log, "Delete type=%d #%lld\n", static_cast<int>(type),
-            static_cast<unsigned long long>(number));
+        Log(options_.info_log, "Delete type=%s #%lld\n",
+            FileTypeMap[type].data(), static_cast<unsigned long long>(number));
       }
     }
   }
@@ -379,7 +394,7 @@ Status DBImpl::Recover(VersionEdit* edit, bool* save_manifest) {
     return s;
   }
 
-  s = vlog_->ParseValidInterval();  //还原有效区间
+  s = vlog_->ParseValidInterval();
   if (!s.ok()) {
     return s;
   }
@@ -561,14 +576,18 @@ Status DBImpl::RecoverLogFile(uint64_t log_number, bool last_log,
   return status;
 }
 
-Status DBImpl::WriteLevel0Table(MemTable* mem, VersionEdit* edit,
-                                Version* base) {
+Status DBImpl::WriteLevel0Table(
+    MemTable* mem, VersionEdit* edit, Version* base,
+    const std::vector<std::pair<std::string, std::string>>& lists) {
   mutex_.AssertHeld();
   const uint64_t start_micros = env_->NowMicros();
   FileMetaData meta;
   meta.number = versions_->NewFileNumber();
   pending_outputs_.insert(meta.number);
-  Iterator* iter = mem->NewIterator();
+  Iterator* iter = nullptr;
+  if (mem != nullptr) {
+    iter = mem->NewIterator();
+  }
   Log(options_.info_log, "Level-0 table #%llu: started",
       (unsigned long long)meta.number);
 
@@ -577,7 +596,7 @@ Status DBImpl::WriteLevel0Table(MemTable* mem, VersionEdit* edit,
     mutex_.Unlock();
     if (s.ok()) {
       s = BuildTable(dbname_, env_, options_, table_cache_, iter, &meta,
-                     vlog_.get());
+                     vlog_.get(), lists);
     }
     mutex_.Lock();
   }
@@ -605,7 +624,37 @@ Status DBImpl::WriteLevel0Table(MemTable* mem, VersionEdit* edit,
   stats.micros = env_->NowMicros() - start_micros;
   stats.bytes_written = meta.file_size;
   stats_[level].Add(stats);
+  Log(options_.info_log, "Pick table#%llu in level-%d",
+      (unsigned long long)meta.number, level);
   return s;
+}
+
+void DBImpl::CompactEntryList(
+    const std::vector<std::pair<std::string, std::string>>& lists) {
+  mutex_.AssertHeld();
+
+  // Save the contents of the memtable as a new Table
+  VersionEdit edit;
+  Version* base = versions_->current();
+  base->Ref();
+  Status s = WriteLevel0Table(nullptr, &edit, base, lists);
+  base->Unref();
+
+  if (s.ok() && shutting_down_.load(std::memory_order_acquire)) {
+    s = Status::IOError("Deleting DB during memtable compaction");
+  }
+
+  // Replace immutable memtable with the generated Table
+  if (s.ok()) {
+    edit.SetPrevLogNumber(0);
+    edit.SetLogNumber(logfile_number_);  // Earlier logs no longer needed
+    s = versions_->LogAndApply(&edit, &mutex_);
+  }
+  if (s.ok()) {
+    RemoveObsoleteFiles();
+  } else {
+    RecordBackgroundError(s);
+  }
 }
 
 void DBImpl::CompactMemTable() {
@@ -686,6 +735,7 @@ void DBImpl::TEST_CompactRange(int level, const Slice* begin,
          bg_error_.ok()) {
     if (manual_compaction_ == nullptr) {  // Idle
       manual_compaction_ = &manual;
+      Log(options_.info_log, "TestCompact Range");
       MaybeScheduleCompaction();
     } else {  // Running either my compaction or another compaction.
       background_work_finished_signal_.Wait();
@@ -743,6 +793,7 @@ void DBImpl::BGWork(void* db) {
 }
 
 void DBImpl::BackgroundCall() {
+  // Log(options_.info_log,"BackgroundCall thread_id %ld\n",detail::gettid());
   MutexLock l(&mutex_);
   assert(background_compaction_scheduled_);
   if (shutting_down_.load(std::memory_order_acquire)) {
@@ -753,23 +804,29 @@ void DBImpl::BackgroundCall() {
     BackgroundCompaction();
   }
 
+  // MaybeScheduleGC();
+
   background_compaction_scheduled_ = false;
 
   // Previous compaction may have produced too many files in a level,
   // so reschedule another compaction if needed.
   MaybeScheduleCompaction();
-  if (has_major_compact_) {
-    mutex_.Unlock();
-    Status s = vlog_->StartGC();
-    if (!s.ok()) {
-      Log(options_.info_log, "VLog GC error:%s\n", s.ToString().c_str());
-    }
-    mutex_.Lock();
-    has_major_compact_ = false;
-  }
   background_work_finished_signal_.SignalAll();
 }
 
+void DBImpl::MaybeScheduleGC() {
+  //  Log(options_.info_log,"MaybeScheudleGC thread_id %ld\n",detail::gettid());
+  if (options_.enable_garbage_collection) {
+    if (has_major_compact_) {
+      mutex_.Unlock();
+      Status s = StartGC();  //里面会lock
+      if (!s.ok()) {
+        Log(options_.info_log, "ScheuleGC error:%s\n", s.ToString().c_str());
+      }
+      has_major_compact_ = false;
+    }
+  }
+}
 void DBImpl::BackgroundCompaction() {
   mutex_.AssertHeld();
 
@@ -816,7 +873,6 @@ void DBImpl::BackgroundCompaction() {
         static_cast<unsigned long long>(f->number), c->level() + 1,
         static_cast<unsigned long long>(f->file_size),
         status.ToString().c_str(), versions_->LevelSummary(&tmp));
-    has_major_compact_ = true;
   } else {
     CompactionState* compact = new CompactionState(c);
     status = DoCompactionWork(compact);
@@ -844,6 +900,17 @@ void DBImpl::BackgroundCompaction() {
       m->done = true;
     }
     if (!m->done) {
+      ParsedInternalKey parsed_begin;
+      ParsedInternalKey parsed_manual;
+      //防止无限gc
+      /*  if (m->begin) {
+          if (ParseInternalKey(m->begin->Encode(), &parsed_begin) &&
+              ParseInternalKey(manual_end.Encode(), &parsed_manual)) {
+            if (parsed_begin.user_key.compare(parsed_manual.user_key) == 0) {
+              m->done = true;
+            }
+          }
+        }*/
       // We only compacted part of the requested range.  Update *m
       // to the range that is left to be compacted.
       m->tmp_storage = manual_end;
@@ -1070,6 +1137,10 @@ Status DBImpl::DoCompactionWork(CompactionState* compact) {
       if (compact->builder->NumEntries() == 0) {
         compact->current_output()->smallest.DecodeFrom(key);
       }
+
+      Log(options_.info_log, "Save user_key:%s,sequence %ld",
+          ikey.user_key.data(), ikey.sequence);
+
       compact->current_output()->largest.DecodeFrom(key);
       compact->builder->Add(key, input->value());
 
@@ -1195,7 +1266,6 @@ Status DBImpl::Get(const ReadOptions& options, const Slice& key,
   } else {
     snapshot = versions_->LastSequence();
   }
-  fprintf(stderr, "need key %s,sequence %ld\n", key.data(), snapshot);
 
   MemTable* mem = mem_;
   MemTable* imm = imm_;
@@ -1368,7 +1438,8 @@ WriteBatch* DBImpl::BuildBatchGroup(Writer** last_writer) {
   for (; iter != writers_.end(); ++iter) {
     Writer* w = *iter;
     if (w->sync && !first->sync) {
-      // Do not include a sync write into a batch handled by a non-sync write.
+      // Do not include a sync write into a batch handled by a non-sync
+      // write.
       break;
     }
 
@@ -1393,6 +1464,38 @@ WriteBatch* DBImpl::BuildBatchGroup(Writer** last_writer) {
   return result;
 }
 
+void DBImpl::AddSequenceNumberInKeys(
+    std::vector<std::pair<std::string, std::string>>* lists) {
+  uint64_t last_sequence = versions_->LastSequence();
+  uint64_t s = last_sequence + 1;
+  ValueType type = kTypeValue;
+
+  for (auto& entry : *lists) {
+    std::string last_key;
+    std::string key = std::move(entry.first);
+    std::string value = entry.second;
+
+    // size_t 为uint64_t
+    uint32_t key_size = key.size();
+    uint32_t val_size = value.size();
+    uint32_t internal_key_size = key_size + 8;
+    const uint32_t encoded_len =
+        VarintLength(internal_key_size) + internal_key_size;
+
+    last_key.reserve(encoded_len);
+
+    PutVarint32(&last_key, internal_key_size);
+    last_key += key;
+    std::string temp;
+    PutFixed64(&temp, (s << 8) | type);
+    last_key += temp;
+    versions_->SetLastSequence(s);
+    entry.first.assign(last_key.data(), last_key.size());
+
+    s++;
+  }
+}
+
 // REQUIRES: mutex_ is held
 // REQUIRES: this thread is currently at the front of the writer queue
 Status DBImpl::MakeRoomForWrite(bool force) {
@@ -1413,6 +1516,7 @@ Status DBImpl::MakeRoomForWrite(bool force) {
       // individual write by 1ms to reduce latency variance.  Also,
       // this delay hands over some CPU to the compaction thread in
       // case it is sharing the same core as the writer.
+      Log(options_.info_log, "Delay write;waiting...\n");
       mutex_.Unlock();
       env_->SleepForMicroseconds(1000);
       allow_delay = false;  // Do not delay a single write more than once
@@ -1450,6 +1554,7 @@ Status DBImpl::MakeRoomForWrite(bool force) {
       has_imm_.store(true, std::memory_order_release);
       mem_ = new MemTable(internal_comparator_);
       mem_->Ref();
+
       force = false;  // Do not force another compaction if have room
       MaybeScheduleCompaction();
     }
