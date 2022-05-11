@@ -821,15 +821,15 @@ class Benchmark {
   }
 
   void ReadSequential(ThreadState* thread) {
-    Iterator* iter = db_->NewIterator(ReadOptions());
     int i = 0;
     int64_t bytes = 0;
-    for (iter->SeekToFirst(); i < reads_ && iter->Valid(); iter->Next()) {
-      bytes += iter->key().size() + iter->value().size();
+    std::vector<std::pair<std::string, std::string>> kv;
+    Status s = db_->ScanCountOfKV(ReadOptions(), Slice(), reads_, &kv);
+    assert(s.ok());
+    for (auto& [k, v] : kv) {
+      bytes += k.size() + v.size();
       thread->stats.FinishedSingleOp();
-      ++i;
     }
-    delete iter;
     thread->stats.AddBytes(bytes);
   }
 
