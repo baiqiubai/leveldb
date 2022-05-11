@@ -32,6 +32,72 @@ void Prefetcher::LazyNewIterator(const ReadOptions& options) {
   }
 }
 
+Status Prefetcher::FetchOnlyValue(const ReadOptions& options,
+                                  const Slice& start, uint32_t count,
+                                  std::vector<std::string>* result) {
+  return HelperFetch(options, start, count, result);
+}
+
+Status Prefetcher::FetchKV(
+    const ReadOptions& options, const Slice& start, uint32_t count,
+    std::vector<std::pair<std::string, std::string>>* result) {
+  return HelperFetch(options, start, count, nullptr, true, result);
+}
+
+Status Prefetcher::HelperFetch(
+    const ReadOptions& options, const Slice& start, uint32_t count,
+    std::vector<std::string>* values, bool get_kv,
+    std::vector<std::pair<std::string, std::string>>* result) {
+  LazyNewIterator(options);
+
+  int32_t i = 0;
+  std::vector<std::string> temp_values;
+  std::vector<std::string> temp_keys;
+  if (get_kv) {
+    temp_keys.reserve(count);
+    temp_values.resize(count);
+    values = &temp_values;
+  } else {
+    values->reserve(count);
+  }
+  thread_pool_->SetTaskNum(count);
+
+  if (start.compare(Slice()) == 0) {
+    iter_->SeekToFirst();
+  } else {
+    iter_->Seek(start);
+  }
+
+  for (; iter_->Valid() && count--; iter_->Next()) {
+    bool is_memtable_iterator =
+        (typeid(*iter_->current()) == typeid(MemTableIterator)) ? true : false;
+    if (is_memtable_iterator) {
+      (*values)[i] = std::move(iter_->value().ToString());
+    } else {
+      uint64_t offset = DecodeFixed64(iter_->value().data());
+      thread_pool_->AddTask(
+          std::bind(&VLog::Get, vlog_, offset, &(*values)[i]));
+    }
+    if (get_kv) {
+      temp_keys.emplace_back(std::move(iter_->key().ToString()));
+    }
+    ++i;
+  }
+
+  while (!thread_pool_->AllTaskIsFinished()) {
+    ;
+  }
+
+  if (get_kv) {
+    assert(temp_keys.size() == temp_values.size());
+    for (int i = 0; i < count; ++i) {
+      result->push_back({temp_keys[i], temp_values[i]});
+    }
+  }
+
+  return Status::OK();
+}
+
 Status Prefetcher::Fetch(const ReadOptions& options, const Slice& start,
                          const Slice& end, std::vector<std::string>* result,
                          bool is_forward_scan) {
@@ -85,39 +151,6 @@ Status Prefetcher::Fetch(const ReadOptions& options, const Slice& start,
     result->emplace_back(it.get());
   }
 
-  return Status::OK();
-}
-
-Status Prefetcher::Fetch(const ReadOptions& options, const Slice& start,
-                         uint32_t count, std::vector<std::string>* result) {
-  LazyNewIterator(options);
-
-  int32_t i = 0;
-  result->resize(count);
-  thread_pool_->SetTaskNum(count);
-
-  if (start.compare(Slice()) == 0) {
-    iter_->SeekToFirst();
-  } else {
-    iter_->Seek(start);
-  }
-
-  for (; iter_->Valid() && count--; iter_->Next()) {
-    bool is_memtable_iterator =
-        (typeid(*iter_->current()) == typeid(MemTableIterator)) ? true : false;
-    if (is_memtable_iterator) {
-      (*result)[i] = iter_->value().ToString();
-    } else {
-      uint64_t offset = DecodeFixed64(iter_->value().data());
-      thread_pool_->AddTask(
-          std::bind(&VLog::Get, vlog_, offset, &(*result)[i]));
-    }
-    ++i;
-  }
-
-  while (!thread_pool_->AllTaskIsFinished()) {
-    ;
-  }
   return Status::OK();
 }
 

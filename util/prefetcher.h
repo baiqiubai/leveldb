@@ -25,11 +25,19 @@ class Prefetcher {
   Status Fetch(const ReadOptions&, const Slice& start, const Slice& end,
                std::vector<std::string>* result, bool is_forward_scan);
 
-  Status Fetch(const ReadOptions&, const Slice& start, uint32_t count,
-               std::vector<std::string>* result);
+  Status FetchOnlyValue(const ReadOptions&, const Slice& start, uint32_t count,
+                        std::vector<std::string>* result);
+
+  Status FetchKV(const ReadOptions&, const Slice& start, uint32_t count,
+                 std::vector<std::pair<std::string, std::string>>* result);
 
  private:
   void LazyNewIterator(const ReadOptions& options);
+
+  Status HelperFetch(
+      const ReadOptions&, const Slice& start, uint32_t count,
+      std::vector<std::string>* values, bool get_kv = false,
+      std::vector<std::pair<std::string, std::string>>* result = nullptr);
 
   DB* db_;
   VLog* vlog_;
