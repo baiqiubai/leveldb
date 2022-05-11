@@ -210,15 +210,17 @@ Status VLog::StartGC() {
   if (tail_ == head_) return Status::OK();
 
   uint64_t parse_offset = tail_;
-  uint64_t last_tail = tail_;
-  uint64_t last_head = head_;
-  uint64_t new_head = head_;
+  uint64_t end_offset = head_;
+  uint64_t new_offset = head_;
   Status s;
+  std::vector<std::pair<std::string, std::string>> lists;
+  uint64_t total_size = 0;
+  ReadOptions readoptions;
 
-  Log(options_->info_log, "Start GC [tail:%ld->head:%ld]", last_tail,
-      last_head);
+  Log(options_->info_log, "Start GC [tail:%ld->head:%ld]", parse_offset,
+      end_offset);
 
-  while (parse_offset < last_head) {
+  while (parse_offset < end_offset) {
     std::string key;
     std::string value_offset;
 
@@ -235,41 +237,65 @@ Status VLog::StartGC() {
     std::string value;
     bool need_reinsert = true;
     std::string no_sequence_key = parse_key.user_key.ToString();
+    std::unique_ptr<Snapshot> temp_snapshot(
+        new SnapshotImpl(parse_key.sequence));
+    readoptions.snapshot = temp_snapshot.get();
 
-    s = db_->Get(ReadOptions(), no_sequence_key, &value);  //去掉sequence
-    // TODO 需要重新插入lsm-tree 调整offset
+    s = db_->Get(readoptions, no_sequence_key, &value);
+
     if (!s.ok()) {
-      need_reinsert = false;  //需要舍弃
+      need_reinsert = false;
     }
 
-    Log(options_->info_log, "Key:%s Parse offset %ld finished,need_reinsert %s",
-        key.data(), parse_offset, need_reinsert ? "true" : "false");
-
     if (need_reinsert) {
-      std::string new_offset;
-      PutFixed64(&new_offset, new_head);
-      s = ReInsertInVLog(key, value, &new_head);
+      std::string offset_str;
+      uint64_t temp_offset = new_offset;
+      PutFixed64(&offset_str, new_offset);
+      s = ReInsertInVLog(key, value, &new_offset);
       if (!s.ok()) {
+        Log(options_->info_log, "ReInsert K-V in VLOG error:%s",
+            s.ToString().c_str());
         return s;
+      } else {
+        Log(options_->info_log,
+            "ReInsert K-V in VLOG success,user_key:%s,sequence %ld",
+            no_sequence_key.data(), parse_key.sequence);
       }
+      total_size += static_cast<uint64_t>(key.size());
+      total_size += static_cast<uint64_t>(value.size());
+      lists.push_back({no_sequence_key, offset_str});
+      if (total_size > options_->write_buffer_size) {
+        Flush(&lists);
+        total_size = 0;
+        lists.clear();
+      }
+      head_ = new_offset;
     }
     parse_offset += sizeof(uint32_t) * 3;
     parse_offset += static_cast<uint64_t>(key.size());
     parse_offset += static_cast<uint64_t>(value_offset.size());
   }
 
-  s = random_write_vlog_->Fallocate(tail_, last_head - tail_);
+  s = random_write_vlog_->Fallocate(tail_, end_offset - tail_);
   if (!s.ok()) {
     return s;
   }
-  tail_ = last_head;
-  head_ = new_head;
 
-  Log(options_->info_log,
-      "Last Valid Interval[%ld:%ld],Now Valid Interval[%ld:%ld]", last_tail,
-      last_head, tail_, head_);
+  tail_ = end_offset;
 
   return s;
+}
+
+void VLog::Flush(std::vector<std::pair<std::string, std::string>>* lists) {
+  DBImpl* db = reinterpret_cast<DBImpl*>(db_);
+  db->AddSequenceNumberInKeys(lists);
+  const Options* options = options_;
+  std::sort(lists->begin(), lists->end(),
+            [&options](const std::pair<std::string, std::string>& p1,
+                       const std::pair<std::string, std::string>& p2) {
+              return options->comparator->Compare(p1.first, p2.first) < 0;
+            });
+  db->CompactEntryList(*lists);
 }
 
 Status VLog::ParseValidInterval() {

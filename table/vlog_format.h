@@ -5,6 +5,7 @@
 
 #include <future>
 #include <memory>
+#include <vector>
 
 #include "include/leveldb/status.h"
 
@@ -33,9 +34,9 @@ class VLog {
 
   Status GetUsePromise(uint64_t offset, std::promise<std::string>* value);
 
-  uint64_t Tail() const { return tail_; }
+  uint64_t ValidTail() const { return tail_; }
 
-  uint64_t Head() const { return head_; }
+  uint64_t ValidHead() const { return head_; }
 
   Status Finish();
 
@@ -67,6 +68,8 @@ class VLog {
                   Slice* result);
 
   Status InitAllFile();
+
+  void Flush(std::vector<std::pair<std::string, std::string>>* lists);
 
   DB* db_;  // search in lsm-tree
   const Options* options_;
