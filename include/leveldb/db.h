@@ -7,6 +7,7 @@
 
 #include <cstdint>
 #include <cstdio>
+#include <vector>
 
 #include "leveldb/export.h"
 #include "leveldb/iterator.h"
@@ -27,7 +28,7 @@ class WriteBatch;
 // A Snapshot is an immutable object and can therefore be safely
 // accessed from multiple threads without any external synchronization.
 class LEVELDB_EXPORT Snapshot {
- protected:
+ public:  // TODO 原来是protected
   virtual ~Snapshot();
 };
 
@@ -146,6 +147,25 @@ class LEVELDB_EXPORT DB {
   //    db->CompactRange(nullptr, nullptr);
   virtual void CompactRange(const Slice* begin, const Slice* end) = 0;
 
+  //扫描从start开始的count个k-v对 如果没有出错结果放入result中
+  virtual Status ScanCountOfValue(const ReadOptions&, const Slice& start,
+                                  uint32_t count,
+                                  std::vector<std::string>* result) = 0;
+
+  virtual Status ScanCountOfKV(
+      const ReadOptions&, const Slice& start, uint32_t count,
+      std::vector<std::pair<std::string, std::string>>* result) = 0;
+
+  //扫描[start,end]区间的所有k-v对
+  //此处start为""代表从开始扫描到end
+  // end为""代表从start扫描到末尾 正向扫描
+  virtual Status ForwardScan(const ReadOptions&, const Slice& start,
+                             const Slice& end,
+                             std::vector<std::string>* result) = 0;
+
+  virtual Status BackwardScan(const ReadOptions&, const Slice& start,
+                              const Slice& end,
+                              std::vector<std::string>* result) = 0;
   // virtual std::string GetName() const = 0;
 
   //  virtual Status StartGC() = 0;
