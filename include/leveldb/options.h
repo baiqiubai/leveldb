@@ -6,6 +6,7 @@
 #define STORAGE_LEVELDB_INCLUDE_OPTIONS_H_
 
 #include <cstddef>
+#include <cstdint>
 
 #include "leveldb/export.h"
 
@@ -140,6 +141,8 @@ struct LEVELDB_EXPORT Options {
   // Many applications will benefit from passing the result of
   // NewBloomFilterPolicy() here.
   const FilterPolicy* filter_policy = nullptr;
+
+  bool enable_garbage_collection = true;
 };
 
 // Options that control read operations
