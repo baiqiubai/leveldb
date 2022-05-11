@@ -285,14 +285,13 @@ static void SaveValue(void* arg, const Slice& ikey, const Slice& v) {
   } else {
     if (s->ucmp->Compare(parsed_key.user_key, s->user_key) == 0) {
       uint64_t offset = DecodeFixed64(v.data());
-      if (offset < s->vlog_->Tail() || offset > s->vlog_->Head()) {
+      if (offset < s->vlog_->ValidTail() || offset > s->vlog_->ValidHead()) {
         s->state = kDeleted;
       } else {
         s->state = (parsed_key.type == kTypeValue) ? kFound : kDeleted;
       }
       if (s->state == kFound) {
         s->vlog_->Get(offset, s->value);
-        // s->value->assign(v.data(), v.size());
       }
     }
   }

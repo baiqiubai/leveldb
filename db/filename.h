@@ -30,6 +30,13 @@ enum FileType {
   kInfoLogFile  // Either the current one, or an old one
 };
 
+static const std::string FileTypeMap[] = {
+    "kLogFile",        "kDBLockFile",  "kTableFile",
+    "kDescriptorFile", "kCurrentFile", "kTempFile",
+    "kVLog",           "kInfoLogFile"
+
+};
+
 // Return the name of the log file with the specified number
 // in the db named by "dbname".  The result will be prefixed with
 // "dbname".
