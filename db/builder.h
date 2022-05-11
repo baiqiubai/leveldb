@@ -6,6 +6,7 @@
 #define STORAGE_LEVELDB_DB_BUILDER_H_
 
 #include <memory>
+#include <vector>
 
 #include "leveldb/status.h"
 
@@ -25,9 +26,10 @@ class DB;
 // *meta will be filled with metadata about the generated table.
 // If no data is present in *iter, meta->file_size will be set to
 // zero, and no Table file will be produced.
-Status BuildTable(const std::string& dbname, Env* env, const Options& options,
-                  TableCache* table_cache, Iterator* iter, FileMetaData* meta,
-                  VLog* vlog);
+Status BuildTable(
+    const std::string& dbname, Env* env, const Options& options,
+    TableCache* table_cache, Iterator* iter, FileMetaData* meta, VLog* vlog,
+    const std::vector<std::pair<std::string, std::string>>& lists = {});
 }  // namespace leveldb
 
 #endif  // STORAGE_LEVELDB_DB_BUILDER_H_

@@ -17,16 +17,29 @@
 
 namespace leveldb {
 
-Status BuildTable(const std::string& dbname, Env* env, const Options& options,
-                  TableCache* table_cache, Iterator* iter, FileMetaData* meta,
-                  VLog* vlog) {
+static Slice GetLengthPrefixedSlice(const char* data) {
+  uint32_t len;
+  const char* p = data;
+  p = GetVarint32Ptr(p, p + 5, &len);  // +5: we assume "p" is not corrupted
+  return Slice(p, len);
+}
+
+Status BuildTable(
+    const std::string& dbname, Env* env, const Options& options,
+    TableCache* table_cache, Iterator* iter, FileMetaData* meta, VLog* vlog,
+    const std::vector<std::pair<std::string, std::string>>& lists) {
   Status s;
   meta->file_size = 0;
-  iter->SeekToFirst();
+
+  bool compact_memtable = (iter != nullptr) ? true : false;
+
+  if (compact_memtable) {
+    iter->SeekToFirst();
+  }
 
   std::string fname = TableFileName(dbname, meta->number);
 
-  if (iter->Valid()) {
+  if ((compact_memtable && iter->Valid()) || !compact_memtable) {
     WritableFile* file;
     s = env->NewWritableFile(fname, &file);
     if (!s.ok()) {
@@ -34,19 +47,34 @@ Status BuildTable(const std::string& dbname, Env* env, const Options& options,
     }
 
     TableBuilder* builder = new TableBuilder(options, file);
-    meta->smallest.DecodeFrom(iter->key());
+    if (compact_memtable) {
+      meta->smallest.DecodeFrom(iter->key());
+    } else {
+      meta->smallest.DecodeFrom(
+          GetLengthPrefixedSlice(lists.begin()->first.data()));
+    }
 
     Slice key;
-    for (; iter->Valid(); iter->Next()) {
-      key = iter->key();
-      std::string offset;
-      PutFixed64(&offset, static_cast<uint64_t>(vlog->CurrentSize()));
-      Log(options.info_log, "offset %ld",
-          static_cast<uint64_t>(vlog->CurrentSize()));
-      builder->Add(key, offset);  // value为与key对应value在vLOG中offset
-      /*    Log(options.info_log, "key_size %ld value_size %ld ", key.size(),
-              iter->value().size());*/
-      vlog->Add(key, iter->value());
+    if (compact_memtable) {
+      for (; iter->Valid(); iter->Next()) {
+        key = iter->key();
+        std::string offset;
+        {
+          ParsedInternalKey parsed_key;
+          if (ParseInternalKey(key, &parsed_key)) {
+            Log(options.info_log, "Flush user_key %s,sequence %ld",
+                parsed_key.user_key.data(), parsed_key.sequence);
+          }
+        }
+        PutFixed64(&offset, vlog->CurrentSize());
+        builder->Add(key, offset);  // value为与key对应value在vLOG中offset
+        vlog->Add(key, iter->value());
+      }
+    } else {
+      for (auto& [k, v] : lists) {
+        builder->Add(GetLengthPrefixedSlice(k.data()), v);
+      }
+      key = GetLengthPrefixedSlice(lists.rbegin()->first.data());
     }
     if (!key.empty()) {
       meta->largest.DecodeFrom(key);
@@ -69,7 +97,9 @@ Status BuildTable(const std::string& dbname, Env* env, const Options& options,
     }
 
     if (s.ok()) {
-      s = vlog->Finish();
+      if (compact_memtable) {
+        s = vlog->Finish();
+      }
     }
 
     delete file;
@@ -85,8 +115,11 @@ Status BuildTable(const std::string& dbname, Env* env, const Options& options,
   }
 
   // Check for input iterator errors
-  if (!iter->status().ok()) {
-    s = iter->status();
+
+  if (compact_memtable) {
+    if (!iter->status().ok()) {
+      s = iter->status();
+    }
   }
 
   if (s.ok() && meta->file_size > 0) {
