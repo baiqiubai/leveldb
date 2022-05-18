@@ -131,6 +131,10 @@ class MergingIterator : public Iterator {
 
   Iterator* current() const override { return current_->current(); }
 
+  uint64_t GetBlobNumber() const override { return current()->GetBlobNumber(); }
+
+  uint64_t GetBlobSize() const override { return current()->GetBlobSize(); }
+
  private:
   // Which direction is the iterator moving?
   enum Direction { kForward, kReverse };

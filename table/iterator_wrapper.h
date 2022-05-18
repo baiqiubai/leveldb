@@ -76,6 +76,8 @@ class IteratorWrapper {
 
   Iterator* current() { return iter_; }
 
+  uint64_t GetBlobNumber() const { return iter_->GetBlobNumber(); }
+
  private:
   void Update() {
     valid_ = iter_->Valid();
