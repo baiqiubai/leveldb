@@ -9,6 +9,7 @@
 #include "leveldb/env.h"
 #include "leveldb/filter_policy.h"
 #include "leveldb/options.h"
+
 #include "table/block.h"
 #include "table/filter_block.h"
 #include "table/format.h"
@@ -33,7 +34,27 @@ struct Table::Rep {
 
   BlockHandle metaindex_handle;  // Handle to metaindex_block: saved from footer
   Block* index_block;
+
+  uint64_t blob_number;
+  uint64_t blob_size;
 };
+
+Status Table::ReadBlobState(uint64_t size, RandomAccessFile* file,
+                            std::pair<uint64_t, uint64_t>* blob_state) {
+  char state_buffer[2 * sizeof(uint64_t)];
+  Slice buffer_input;
+  Status s = file->Read(size - Footer::kEncodedLength - 2 * sizeof(uint64_t),
+                        2 * sizeof(uint64_t), &buffer_input, state_buffer);
+  if (s.ok()) {
+    blob_state->first = DecodeFixed64(buffer_input.data());
+    blob_state->second = DecodeFixed64(buffer_input.data() + sizeof(uint64_t));
+  }
+  return s;
+}
+
+uint64_t Table::GetBlobNumber() const { return rep_->blob_number; }
+
+uint64_t Table::GetBlobSize() const { return rep_->blob_size; }
 
 Status Table::Open(const Options& options, RandomAccessFile* file,
                    uint64_t size, Table** table) {
@@ -51,6 +72,13 @@ Status Table::Open(const Options& options, RandomAccessFile* file,
   Footer footer;
   s = footer.DecodeFrom(&footer_input);
   if (!s.ok()) return s;
+
+  std::pair<uint64_t, uint64_t> blob_state;
+  s = ReadBlobState(size, file, &blob_state);
+
+  if (s.ok()) {
+    return s;
+  }
 
   // Read the index block
   BlockContents index_block_contents;
@@ -72,6 +100,8 @@ Status Table::Open(const Options& options, RandomAccessFile* file,
     rep->cache_id = (options.block_cache ? options.block_cache->NewId() : 0);
     rep->filter_data = nullptr;
     rep->filter = nullptr;
+    rep->blob_number = blob_state.first;
+    rep->blob_size = blob_state.second;
     *table = new Table(rep);
     (*table)->ReadMeta(footer);
   }

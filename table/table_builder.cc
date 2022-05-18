@@ -4,12 +4,14 @@
 
 #include "leveldb/table_builder.h"
 
+#include "db/dbformat.h"
 #include <cassert>
 
 #include "leveldb/comparator.h"
 #include "leveldb/env.h"
 #include "leveldb/filter_policy.h"
 #include "leveldb/options.h"
+
 #include "table/block_builder.h"
 #include "table/filter_block.h"
 #include "table/format.h"
@@ -31,7 +33,9 @@ struct TableBuilder::Rep {
         filter_block(opt.filter_policy == nullptr
                          ? nullptr
                          : new FilterBlockBuilder(opt.filter_policy)),
-        pending_index_entry(false) {
+        pending_index_entry(false),
+        blob_number(0),
+        blob_file_size(0) {
     index_block_options.block_restart_interval = 1;
   }
 
@@ -60,6 +64,9 @@ struct TableBuilder::Rep {
   BlockHandle pending_handle;  // Handle to add to index block
 
   std::string compressed_output;
+
+  uint64_t blob_number;
+  uint64_t blob_file_size;
 };
 
 TableBuilder::TableBuilder(const Options& options, WritableFile* file)
@@ -94,6 +101,7 @@ Status TableBuilder::ChangeOptions(const Options& options) {
 void TableBuilder::Add(const Slice& key, const Slice& value) {
   Rep* r = rep_;
   assert(!r->closed);
+
   if (!ok()) return;
   if (r->num_entries > 0) {
     assert(r->options.comparator->Compare(key, Slice(r->last_key)) > 0);
@@ -147,50 +155,13 @@ void TableBuilder::WriteBlock(BlockBuilder* block, BlockHandle* handle) {
   Rep* r = rep_;
   Slice raw = block->Finish();
 
-  Slice block_contents;
   CompressionType type = r->options.compression;
   // TODO(postrelease): Support more compression options: zlib?
-  switch (type) {
-    case kNoCompression:
-      block_contents = raw;
-      break;
 
-    case kSnappyCompression: {
-      std::string* compressed = &r->compressed_output;
-      if (port::Snappy_Compress(raw.data(), raw.size(), compressed) &&
-          compressed->size() < raw.size() - (raw.size() / 8u)) {
-        block_contents = *compressed;
-      } else {
-        // Snappy not supported, or compressed less than 12.5%, so just
-        // store uncompressed form
-        block_contents = raw;
-        type = kNoCompression;
-      }
-      break;
-    }
-  }
-  WriteRawBlock(block_contents, type, handle);
+  Slice block_contents = GetCompressBlock(raw, &type, &r->compressed_output);
+  WriteRawBlock(block_contents, r->file, type, handle, &r->offset);
   r->compressed_output.clear();
   block->Reset();
-}
-
-void TableBuilder::WriteRawBlock(const Slice& block_contents,
-                                 CompressionType type, BlockHandle* handle) {
-  Rep* r = rep_;
-  handle->set_offset(r->offset);
-  handle->set_size(block_contents.size());
-  r->status = r->file->Append(block_contents);
-  if (r->status.ok()) {
-    char trailer[kBlockTrailerSize];
-    trailer[0] = type;
-    uint32_t crc = crc32c::Value(block_contents.data(), block_contents.size());
-    crc = crc32c::Extend(crc, trailer, 1);  // Extend crc to cover block type
-    EncodeFixed32(trailer + 1, crc32c::Mask(crc));
-    r->status = r->file->Append(Slice(trailer, kBlockTrailerSize));
-    if (r->status.ok()) {
-      r->offset += block_contents.size() + kBlockTrailerSize;
-    }
-  }
 }
 
 Status TableBuilder::status() const { return rep_->status; }
@@ -205,8 +176,8 @@ Status TableBuilder::Finish() {
 
   // Write filter block
   if (ok() && r->filter_block != nullptr) {
-    WriteRawBlock(r->filter_block->Finish(), kNoCompression,
-                  &filter_block_handle);
+    WriteRawBlock(r->filter_block->Finish(), r->file, kNoCompression,
+                  &filter_block_handle, &r->offset);
   }
 
   // Write metaindex block
@@ -237,6 +208,12 @@ Status TableBuilder::Finish() {
     WriteBlock(&r->index_block, &index_block_handle);
   }
 
+  std::string encode_state;
+  WriteBlobState(&encode_state);
+  r->status = r->file->Append(encode_state);
+  if (r->status.ok()) {
+    r->offset += encode_state.size();
+  }
   // Write footer
   if (ok()) {
     Footer footer;
@@ -262,4 +239,16 @@ uint64_t TableBuilder::NumEntries() const { return rep_->num_entries; }
 
 uint64_t TableBuilder::FileSize() const { return rep_->offset; }
 
+void TableBuilder::SetBlobNumber(uint64_t blob_number) {
+  rep_->blob_number = blob_number;
+}
+
+void TableBuilder::SetBlobSize(uint64_t blob_size) {
+  rep_->blob_file_size = blob_size;
+}
+
+void TableBuilder::WriteBlobState(std::string* encode_state) {
+  PutFixed64(encode_state, rep_->blob_number);
+  PutFixed64(encode_state, rep_->blob_file_size);
+}
 }  // namespace leveldb
