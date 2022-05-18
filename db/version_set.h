@@ -34,11 +34,11 @@ class Compaction;
 class Iterator;
 class MemTable;
 class TableBuilder;
-class TableCache;
+class BasicCache;
 class Version;
 class VersionSet;
 class WritableFile;
-class VLog;
+class BlobFileMetaData;
 
 // Return the smallest index i such that files[i]->largest >= key.
 // Return files.size() if there is no such file.
@@ -155,6 +155,8 @@ class Version {
   // List of files per level
   std::vector<FileMetaData*> files_[config::kNumLevels];
 
+  std::vector<BlobFileMetaData*> blob_file_;
+
   // Next file to compact based on seek stats.
   FileMetaData* file_to_compact_;
   int file_to_compact_level_;
@@ -169,7 +171,8 @@ class Version {
 class VersionSet {
  public:
   VersionSet(const std::string& dbname, const Options* options,
-             TableCache* table_cache, const InternalKeyComparator*, VLog* vlog);
+             BasicCache* table_cache, BasicCache* blob_cache,
+             const InternalKeyComparator*);
   VersionSet(const VersionSet&) = delete;
   VersionSet& operator=(const VersionSet&) = delete;
 
@@ -212,6 +215,8 @@ class VersionSet {
 
   // Return the last sequence number.
   uint64_t LastSequence() const { return last_sequence_; }
+
+  uint64_t BlobFileNumber() { return blob_number_++; }
 
   // Set the last sequence number to s.
   void SetLastSequence(uint64_t s) {
@@ -298,13 +303,15 @@ class VersionSet {
   Env* const env_;
   const std::string dbname_;
   const Options* const options_;
-  TableCache* const table_cache_;
+  BasicCache* const table_cache_;
+  BasicCache* const blob_cache_;
   const InternalKeyComparator icmp_;
   uint64_t next_file_number_;
   uint64_t manifest_file_number_;
   uint64_t last_sequence_;
   uint64_t log_number_;
   uint64_t prev_log_number_;  // 0 or backing store for memtable being compacted
+  uint64_t blob_number_;      // for blobfile
 
   // Opened lazily
   WritableFile* descriptor_file_;
@@ -315,8 +322,6 @@ class VersionSet {
   // Per-level key at which the next compaction at that level should start.
   // Either an empty string, or a valid InternalKey.
   std::string compact_pointer_[config::kNumLevels];
-
-  VLog* vlog_;
 };
 
 // A Compaction encapsulates information about a compaction.

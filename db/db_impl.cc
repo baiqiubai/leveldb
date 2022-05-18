@@ -11,7 +11,6 @@
 #include "db/log_reader.h"
 #include "db/log_writer.h"
 #include "db/memtable.h"
-#include "db/table_cache.h"
 #include "db/version_set.h"
 #include "db/write_batch_internal.h"
 #include <algorithm>
@@ -36,11 +35,12 @@
 #include "table/block.h"
 #include "table/merger.h"
 #include "table/two_level_iterator.h"
-#include "table/vlog_format.h"
 #include "util/coding.h"
 #include "util/logging.h"
 #include "util/mutexlock.h"
-#include "util/prefetcher.h"
+
+#include "blob/basic_cache.h"
+#include "blob/blob_builder.h"
 
 namespace leveldb {
 
@@ -69,8 +69,16 @@ struct DBImpl::CompactionState {
     uint64_t file_size;
     InternalKey smallest, largest;
   };
+  struct OutputBlobFile {
+    uint64_t number;
+    uint64_t file_size;
+  };
 
   Output* current_output() { return &outputs[outputs.size() - 1]; }
+
+  OutputBlobFile* current_outputblobfile() {
+    return &outputs_blob_file[outputs_blob_file.size() - 1];
+  }
 
   explicit CompactionState(Compaction* c)
       : compaction(c),
@@ -88,10 +96,13 @@ struct DBImpl::CompactionState {
   SequenceNumber smallest_snapshot;
 
   std::vector<Output> outputs;
-
+  std::vector<OutputBlobFile> outputs_blob_file;
   // State kept for output being generated
   WritableFile* outfile;
   TableBuilder* builder;
+
+  WritableFile* blob_file;
+  BlobBuilder* blob_builder;
 
   uint64_t total_bytes;
 };
@@ -144,6 +155,7 @@ DBImpl::DBImpl(const Options& raw_options, const std::string& dbname)
       owns_cache_(options_.block_cache != raw_options.block_cache),
       dbname_(dbname),
       table_cache_(new TableCache(dbname_, options_, TableCacheSize(options_))),
+      blob_cache_(new BlobCache(dbname_, options_, TableCacheSize(options_))),
       db_lock_(nullptr),
       shutting_down_(false),
       background_work_finished_signal_(&mutex_),
@@ -157,12 +169,8 @@ DBImpl::DBImpl(const Options& raw_options, const std::string& dbname)
       tmp_batch_(new WriteBatch),
       background_compaction_scheduled_(false),
       manual_compaction_(nullptr),
-      vlog_(new VLog(this, &options_, env_, vLogFileName(dbname_))),
-      versions_(new VersionSet(dbname_, &options_, table_cache_,
-                               &internal_comparator_, vlog_.get())),
-      prefetcher_(new Prefetcher(this, vlog_.get())),
-      has_major_compact_(false) {}
-
+      versions_(new VersionSet(dbname_, &options_, table_cache_, blob_cache_,
+                               &internal_comparator_)) {}
 DBImpl::~DBImpl() {
   // Wait for background work to finish.
   mutex_.Lock();
@@ -177,8 +185,6 @@ DBImpl::~DBImpl() {
   if (db_lock_ != nullptr) {
     env_->UnlockFile(db_lock_);
   }
-  vlog_.reset();
-  prefetcher_.reset();
 
   delete versions_;
   if (mem_ != nullptr) mem_->Unref();
@@ -196,27 +202,16 @@ DBImpl::~DBImpl() {
   }
 }
 
-std::string DBImpl::GetName() const { return dbname_; }
-
-Status DBImpl::StartGC() {
-  if (vlog_ != nullptr) {
-    return vlog_->StartGC();
-  }
-  return Status::NotSupported("No GC");
+Status DBImpl::ScanNumOfValue(const ReadOptions& options, const Slice& start,
+                              uint32_t count,
+                              std::vector<std::string>* result) {
+  return Status::OK();
 }
 
-VLog* DBImpl::GetVLog() { return vlog_.get(); }
-
-Status DBImpl::ScanCountOfValue(const ReadOptions& options, const Slice& start,
-                                uint32_t count,
-                                std::vector<std::string>* result) {
-  return prefetcher_->FetchOnlyValue(options, start, count, result);
-}
-
-Status DBImpl::ScanCountOfKV(
+Status DBImpl::ScanNumOfEntries(
     const ReadOptions& options, const Slice& start, uint32_t count,
     std::vector<std::pair<std::string, std::string>>* result) {
-  return prefetcher_->FetchKV(options, start, count, result);
+  return Status::OK();
 }
 
 Status DBImpl::BackwardScan(const ReadOptions& options, const Slice& start,
@@ -233,7 +228,7 @@ Status DBImpl::ForwardScan(const ReadOptions& options, const Slice& start,
 Status DBImpl::Scan(const ReadOptions& options, const Slice& start,
                     const Slice& end, std::vector<std::string>* result,
                     bool is_forward_scan) {
-  return prefetcher_->Fetch(options, start, end, result, is_forward_scan);
+  return Status::OK();
 }
 
 Status DBImpl::NewDB() {
@@ -267,10 +262,6 @@ Status DBImpl::NewDB() {
     s = SetCurrentFile(env_, dbname_, 1);
   } else {
     env_->RemoveFile(manifest);
-  }
-
-  if (s.ok()) {
-    s = vlog_->PersistenceInterval();  //持久化tail and head
   }
 
   return s;
@@ -367,10 +358,8 @@ Status DBImpl::Recover(VersionEdit* edit, bool* save_manifest) {
 
   bool has_current_file =
       (env_->FileExists(CurrentFileName(dbname_))) ? true : false;
-  bool has_interval_vlog_file =
-      (env_->FileExists(vLogValidIntervalFileName(dbname_))) ? true : false;
 
-  if (!has_current_file || !has_interval_vlog_file) {
+  if (!has_current_file) {
     if (options_.create_if_missing) {
       Log(options_.info_log, "Creating DB %s since it was missing.",
           dbname_.c_str());
@@ -390,11 +379,6 @@ Status DBImpl::Recover(VersionEdit* edit, bool* save_manifest) {
   }
 
   s = versions_->Recover(save_manifest);
-  if (!s.ok()) {
-    return s;
-  }
-
-  s = vlog_->ParseValidInterval();
   if (!s.ok()) {
     return s;
   }
@@ -576,18 +560,17 @@ Status DBImpl::RecoverLogFile(uint64_t log_number, bool last_log,
   return status;
 }
 
-Status DBImpl::WriteLevel0Table(
-    MemTable* mem, VersionEdit* edit, Version* base,
-    const std::vector<std::pair<std::string, std::string>>& lists) {
+Status DBImpl::WriteLevel0Table(MemTable* mem, VersionEdit* edit,
+                                Version* base) {
   mutex_.AssertHeld();
   const uint64_t start_micros = env_->NowMicros();
   FileMetaData meta;
+  BlobFileMetaData blob_meta;
+  blob_meta.number = versions_->BlobFileNumber();
   meta.number = versions_->NewFileNumber();
   pending_outputs_.insert(meta.number);
-  Iterator* iter = nullptr;
-  if (mem != nullptr) {
-    iter = mem->NewIterator();
-  }
+  Iterator* iter = mem->NewIterator();
+
   Log(options_.info_log, "Level-0 table #%llu: started",
       (unsigned long long)meta.number);
 
@@ -596,7 +579,7 @@ Status DBImpl::WriteLevel0Table(
     mutex_.Unlock();
     if (s.ok()) {
       s = BuildTable(dbname_, env_, options_, table_cache_, iter, &meta,
-                     vlog_.get(), lists);
+                     &blob_meta);
     }
     mutex_.Lock();
   }
@@ -610,7 +593,7 @@ Status DBImpl::WriteLevel0Table(
   // Note that if file_size is zero, the file has been deleted and
   // should not be added to the manifest.
   int level = 0;
-  if (s.ok() && meta.file_size > 0) {
+  if (s.ok() && meta.file_size > 0 && blob_meta.file_size > 0) {
     const Slice min_user_key = meta.smallest.user_key();
     const Slice max_user_key = meta.largest.user_key();
     if (base != nullptr) {
@@ -618,6 +601,7 @@ Status DBImpl::WriteLevel0Table(
     }
     edit->AddFile(level, meta.number, meta.file_size, meta.smallest,
                   meta.largest);
+    edit->AddBlobFile(blob_meta.number, blob_meta.file_size);
   }
 
   CompactionStats stats;
@@ -627,34 +611,6 @@ Status DBImpl::WriteLevel0Table(
   Log(options_.info_log, "Pick table#%llu in level-%d",
       (unsigned long long)meta.number, level);
   return s;
-}
-
-void DBImpl::CompactEntryList(
-    const std::vector<std::pair<std::string, std::string>>& lists) {
-  mutex_.AssertHeld();
-
-  // Save the contents of the memtable as a new Table
-  VersionEdit edit;
-  Version* base = versions_->current();
-  base->Ref();
-  Status s = WriteLevel0Table(nullptr, &edit, base, lists);
-  base->Unref();
-
-  if (s.ok() && shutting_down_.load(std::memory_order_acquire)) {
-    s = Status::IOError("Deleting DB during memtable compaction");
-  }
-
-  // Replace immutable memtable with the generated Table
-  if (s.ok()) {
-    edit.SetPrevLogNumber(0);
-    edit.SetLogNumber(logfile_number_);  // Earlier logs no longer needed
-    s = versions_->LogAndApply(&edit, &mutex_);
-  }
-  if (s.ok()) {
-    RemoveObsoleteFiles();
-  } else {
-    RecordBackgroundError(s);
-  }
 }
 
 void DBImpl::CompactMemTable() {
@@ -735,7 +691,6 @@ void DBImpl::TEST_CompactRange(int level, const Slice* begin,
          bg_error_.ok()) {
     if (manual_compaction_ == nullptr) {  // Idle
       manual_compaction_ = &manual;
-      Log(options_.info_log, "TestCompact Range");
       MaybeScheduleCompaction();
     } else {  // Running either my compaction or another compaction.
       background_work_finished_signal_.Wait();
@@ -804,7 +759,7 @@ void DBImpl::BackgroundCall() {
     BackgroundCompaction();
   }
 
-  // MaybeScheduleGC();
+  MaybeScheduleGC();
 
   background_compaction_scheduled_ = false;
 
@@ -814,17 +769,53 @@ void DBImpl::BackgroundCall() {
   background_work_finished_signal_.SignalAll();
 }
 
-void DBImpl::MaybeScheduleGC() {
-  //  Log(options_.info_log,"MaybeScheudleGC thread_id %ld\n",detail::gettid());
+void DBImpl::
+    MaybeScheduleGC() {  //根据collector收集到的信息判断去删除那个blobfile
   if (options_.enable_garbage_collection) {
-    if (has_major_compact_) {
-      mutex_.Unlock();
-      Status s = StartGC();  //里面会lock
-      if (!s.ok()) {
-        Log(options_.info_log, "ScheuleGC error:%s\n", s.ToString().c_str());
-      }
-      has_major_compact_ = false;
+    VersionEdit edit;
+    Status s = StartGC(collector_->GetDeleteBlobFileList(), &edit);
+    mutex_.Lock();
+    if (s.ok()) {
+      s = versions_->LogAndApply(&edit, &mutex_);
     }
+  }
+}
+
+Status DBImpl::StartGC(const std::unordered_set<uint64_t>& discard_blob_list,
+                       VersionEdit* edit) {
+  std::vector<std::string> filenames;
+  env_->GetChildren(dbname_, &filenames);  // Ignoring errors on purpose
+  uint64_t number;
+  FileType type;
+  std::vector<std::string> files_to_delete;
+  for (std::string& filename : filenames) {
+    if (ParseFileName(filename, &number, &type)) {
+      bool keep = true;
+      switch (type) {
+        case kBlobFile:
+          keep = discard_blob_list.count(number) ? false : true;
+          break;
+        default:
+          break;
+      }
+
+      if (!keep) {
+        files_to_delete.push_back(std::move(filename));
+        if (type == kBlobFile) {
+          blob_cache_->Evict(number);
+        }
+        edit->AddBlobFile(number, 0);
+        Log(options_.info_log, "Delete type=%s #%lld\n",
+            FileTypeMap[type].data(), static_cast<unsigned long long>(number));
+      }
+    }
+  }
+  // While deleting all files unblock other threads. All files being deleted
+  // have unique names which will not collide with newly created files and
+  // are therefore safe to delete while allowing other threads to proceed.
+  mutex_.Unlock();
+  for (const std::string& filename : files_to_delete) {
+    env_->RemoveFile(dbname_ + "/" + filename);
   }
 }
 void DBImpl::BackgroundCompaction() {
@@ -882,7 +873,6 @@ void DBImpl::BackgroundCompaction() {
     CleanupCompaction(compact);
     c->ReleaseInputs();
     RemoveObsoleteFiles();
-    has_major_compact_ = true;
   }
   delete c;
 
@@ -900,17 +890,6 @@ void DBImpl::BackgroundCompaction() {
       m->done = true;
     }
     if (!m->done) {
-      ParsedInternalKey parsed_begin;
-      ParsedInternalKey parsed_manual;
-      //防止无限gc
-      /*  if (m->begin) {
-          if (ParseInternalKey(m->begin->Encode(), &parsed_begin) &&
-              ParseInternalKey(manual_end.Encode(), &parsed_manual)) {
-            if (parsed_begin.user_key.compare(parsed_manual.user_key) == 0) {
-              m->done = true;
-            }
-          }
-        }*/
       // We only compacted part of the requested range.  Update *m
       // to the range that is left to be compacted.
       m->tmp_storage = manual_end;
@@ -934,6 +913,13 @@ void DBImpl::CleanupCompaction(CompactionState* compact) {
     const CompactionState::Output& out = compact->outputs[i];
     pending_outputs_.erase(out.number);
   }
+  if (compact->blob_builder != nullptr) {
+    delete compact->blob_builder;
+  } else {
+    assert(compact->blob_file == nullptr);
+  }
+  delete compact->blob_file;
+
   delete compact;
 }
 
@@ -941,71 +927,113 @@ Status DBImpl::OpenCompactionOutputFile(CompactionState* compact) {
   assert(compact != nullptr);
   assert(compact->builder == nullptr);
   uint64_t file_number;
+  uint64_t blob_file_number;
   {
     mutex_.Lock();
     file_number = versions_->NewFileNumber();
+    blob_file_number = versions_->BlobFileNumber();
     pending_outputs_.insert(file_number);
     CompactionState::Output out;
+    CompactionState::OutputBlobFile blob_out;
     out.number = file_number;
     out.smallest.Clear();
     out.largest.Clear();
-    compact->outputs.push_back(out);
+    blob_out.number = file_number;
+    compact->outputs_blob_file.emplace_back(blob_out);
+    compact->outputs.emplace_back(out);
     mutex_.Unlock();
   }
 
   // Make the output file
-  std::string fname = TableFileName(dbname_, file_number);
-  Status s = env_->NewWritableFile(fname, &compact->outfile);
+  std::string sst_fname = TableFileName(dbname_, file_number);
+  std::string blob_fname = BlobFileName(dbname_, blob_file_number);
+  Status s = env_->NewWritableFile(sst_fname, &compact->outfile);
   if (s.ok()) {
     compact->builder = new TableBuilder(options_, compact->outfile);
+  }
+  s = env_->NewWritableFile(blob_fname, &compact->blob_file);
+  if (s.ok()) {
+    compact->blob_builder = new BlobBuilder(options_, compact->blob_file);
+  }
+  return s;
+}
+
+Status DBImpl::FinishCompaction(CompactionState* compact, Iterator* input) {
+  Status s = FinishCompactionOutputFile(compact);
+  if (s.ok()) {
+    compact->builder->SetBlobSize(compact->current_outputblobfile()->file_size);
+    s = FinishCompactionOutputFile(compact, false, input);
   }
   return s;
 }
 
 Status DBImpl::FinishCompactionOutputFile(CompactionState* compact,
+                                          bool is_compact_blob_file,
                                           Iterator* input) {
+  Status s;
   assert(compact != nullptr);
-  assert(compact->outfile != nullptr);
-  assert(compact->builder != nullptr);
+  if (is_compact_blob_file) {
+    assert(compact->outfile != nullptr);
+    assert(compact->builder != nullptr);
 
-  const uint64_t output_number = compact->current_output()->number;
-  assert(output_number != 0);
+    s = compact->blob_builder->Finish();
 
-  // Check for iterator errors
-  Status s = input->status();
-  const uint64_t current_entries = compact->builder->NumEntries();
-  if (s.ok()) {
-    s = compact->builder->Finish();
-  } else {
-    compact->builder->Abandon();
-  }
-  const uint64_t current_bytes = compact->builder->FileSize();
-  compact->current_output()->file_size = current_bytes;
-  compact->total_bytes += current_bytes;
-  delete compact->builder;
-  compact->builder = nullptr;
+    const uint64_t current_bytes = compact->blob_builder->FileSize();
+    compact->current_outputblobfile()->file_size = current_bytes;
+    delete compact->blob_builder;
+    compact->blob_builder = nullptr;
 
-  // Finish and check for file errors
-  if (s.ok()) {
-    s = compact->outfile->Sync();
-  }
-  if (s.ok()) {
-    s = compact->outfile->Close();
-  }
-  delete compact->outfile;
-  compact->outfile = nullptr;
-
-  if (s.ok() && current_entries > 0) {
-    // Verify that the table is usable
-    Iterator* iter =
-        table_cache_->NewIterator(ReadOptions(), output_number, current_bytes);
-    s = iter->status();
-    delete iter;
+    s = compact->blob_file->Sync();
     if (s.ok()) {
-      Log(options_.info_log, "Generated table #%llu@%d: %lld keys, %lld bytes",
-          (unsigned long long)output_number, compact->compaction->level(),
-          (unsigned long long)current_entries,
-          (unsigned long long)current_bytes);
+      compact->blob_file->Close();
+    }
+    delete compact->blob_file;
+    compact->blob_file = nullptr;
+
+  } else {
+    assert(compact->blob_builder != nullptr);
+    assert(compact->blob_file != nullptr);
+
+    const uint64_t output_number = compact->current_output()->number;
+    assert(output_number != 0);
+
+    // Check for iterator errors
+    s = input->status();
+    const uint64_t current_entries = compact->builder->NumEntries();
+    if (s.ok()) {
+      s = compact->builder->Finish();
+    } else {
+      compact->builder->Abandon();
+    }
+    const uint64_t current_bytes = compact->builder->FileSize();
+    compact->current_output()->file_size = current_bytes;
+    compact->total_bytes += current_bytes;
+    delete compact->builder;
+    compact->builder = nullptr;
+
+    // Finish and check for file errors
+    if (s.ok()) {
+      s = compact->outfile->Sync();
+    }
+    if (s.ok()) {
+      s = compact->outfile->Close();
+    }
+    delete compact->outfile;
+    compact->outfile = nullptr;
+
+    if (s.ok() && current_entries > 0) {
+      // Verify that the table is usable
+      Iterator* iter = table_cache_->NewIterator(ReadOptions(), output_number,
+                                                 current_bytes);
+      s = iter->status();
+      delete iter;
+      if (s.ok()) {
+        Log(options_.info_log,
+            "Generated table #%llu@%d: %lld keys, %lld bytes",
+            (unsigned long long)output_number, compact->compaction->level(),
+            (unsigned long long)current_entries,
+            (unsigned long long)current_bytes);
+      }
     }
   }
   return s;
@@ -1026,6 +1054,13 @@ Status DBImpl::InstallCompactionResults(CompactionState* compact) {
     compact->compaction->edit()->AddFile(level + 1, out.number, out.file_size,
                                          out.smallest, out.largest);
   }
+  // add new blob file
+
+  for (size_t i = 0; i < compact->outputs_blob_file.size(); ++i) {
+    const CompactionState::OutputBlobFile& blob = compact->outputs_blob_file[i];
+    compact->compaction->edit()->AddBlobFile(blob.number, blob.file_size);
+  }
+
   return versions_->LogAndApply(compact->compaction->edit(), &mutex_);
 }
 
@@ -1075,7 +1110,7 @@ Status DBImpl::DoCompactionWork(CompactionState* compact) {
     Slice key = input->key();
     if (compact->compaction->ShouldStopBefore(key) &&
         compact->builder != nullptr) {
-      status = FinishCompactionOutputFile(compact, input);
+      status = FinishCompaction(compact, input);
       if (!status.ok()) {
         break;
       }
@@ -1126,6 +1161,8 @@ Status DBImpl::DoCompactionWork(CompactionState* compact) {
         (int)last_sequence_for_key, (int)compact->smallest_snapshot);
 #endif
 
+    bool is_memtable_iter =
+        typeid(input->current()) == typeid(MemTableIterator) ? true : false;
     if (!drop) {
       // Open output file if necessary
       if (compact->builder == nullptr) {
@@ -1138,19 +1175,42 @@ Status DBImpl::DoCompactionWork(CompactionState* compact) {
         compact->current_output()->smallest.DecodeFrom(key);
       }
 
-      Log(options_.info_log, "Save user_key:%s,sequence %ld",
-          ikey.user_key.data(), ikey.sequence);
-
       compact->current_output()->largest.DecodeFrom(key);
-      compact->builder->Add(key, input->value());
+
+      std::string encode_key;
+      uint64_t blob_file_number = compact->current_outputblobfile()->number;
+      compact->builder->SetBlobNumber(blob_file_number);
+
+      std::string value;
+      PutFixed64(&value, compact->blob_builder->CurrentSizeEstimate());
+
+      compact->builder->Add(key, value);
+
+      if (is_memtable_iter) {
+        compact->blob_builder->Add(key, input->value());
+      } else {
+        std::string temp_value;
+        Status s = Get(ReadOptions(), key, &temp_value);
+        if (s.ok()) {
+          compact->blob_builder->Add(key, temp_value);
+        }
+      }
 
       // Close output file if it is big enough
       if (compact->builder->FileSize() >=
           compact->compaction->MaxOutputFileSize()) {
-        status = FinishCompactionOutputFile(compact, input);
+        status = FinishCompaction(compact, input);
         if (!status.ok()) {
           break;
         }
+      }
+    } else {
+      if (!is_memtable_iter) {
+        uint64_t discard_size = static_cast<uint64_t>(key.size()) +
+                                static_cast<uint64_t>(input->value().size());
+        uint64_t blob_number = input->GetBlobNumber();
+        assert(blob_number > 0);
+        collector_->AddDiscardSize(blob_number, discard_size);
       }
     }
 
@@ -1161,7 +1221,7 @@ Status DBImpl::DoCompactionWork(CompactionState* compact) {
     status = Status::IOError("Deleting DB during compaction");
   }
   if (status.ok() && compact->builder != nullptr) {
-    status = FinishCompactionOutputFile(compact, input);
+    status = FinishCompaction(compact, input);
   }
   if (status.ok()) {
     status = input->status();
@@ -1463,39 +1523,6 @@ WriteBatch* DBImpl::BuildBatchGroup(Writer** last_writer) {
   }
   return result;
 }
-
-void DBImpl::AddSequenceNumberInKeys(
-    std::vector<std::pair<std::string, std::string>>* lists) {
-  uint64_t last_sequence = versions_->LastSequence();
-  uint64_t s = last_sequence + 1;
-  ValueType type = kTypeValue;
-
-  for (auto& entry : *lists) {
-    std::string last_key;
-    std::string key = std::move(entry.first);
-    std::string value = entry.second;
-
-    // size_t 为uint64_t
-    uint32_t key_size = key.size();
-    uint32_t val_size = value.size();
-    uint32_t internal_key_size = key_size + 8;
-    const uint32_t encoded_len =
-        VarintLength(internal_key_size) + internal_key_size;
-
-    last_key.reserve(encoded_len);
-
-    PutVarint32(&last_key, internal_key_size);
-    last_key += key;
-    std::string temp;
-    PutFixed64(&temp, (s << 8) | type);
-    last_key += temp;
-    versions_->SetLastSequence(s);
-    entry.first.assign(last_key.data(), last_key.size());
-
-    s++;
-  }
-}
-
 // REQUIRES: mutex_ is held
 // REQUIRES: this thread is currently at the front of the writer queue
 Status DBImpl::MakeRoomForWrite(bool force) {

@@ -8,18 +8,19 @@
 #include "db/log_reader.h"
 #include "db/log_writer.h"
 #include "db/memtable.h"
-#include "db/table_cache.h"
 #include <algorithm>
 #include <cstdio>
 
 #include "leveldb/env.h"
+#include "leveldb/table.h"
 #include "leveldb/table_builder.h"
 
 #include "table/merger.h"
 #include "table/two_level_iterator.h"
-#include "table/vlog_format.h"
 #include "util/coding.h"
 #include "util/logging.h"
+
+#include "blob/basic_cache.h"
 
 namespace leveldb {
 
@@ -212,6 +213,10 @@ class Version::LevelFileNumIterator : public Iterator {
 
   Iterator* current() const override { return nullptr; }
 
+  uint64_t GetBlobNumber() const override { return 0; }
+
+  uint64_t GetBlobSize() const override { return 0; }
+
   Status status() const override { return Status::OK(); }
 
  private:
@@ -274,31 +279,35 @@ struct Saver {
   Slice user_key;
   std::string* value;
 
-  VLog* vlog_;
+  Slice value_;
 };
 }  // namespace
-static void SaveValue(void* arg, const Slice& ikey, const Slice& v) {
+
+static void GetValueState(void* arg, const Slice& ikey, const Slice& v) {
   Saver* s = reinterpret_cast<Saver*>(arg);
   ParsedInternalKey parsed_key;
   if (!ParseInternalKey(ikey, &parsed_key)) {
     s->state = kCorrupt;
   } else {
     if (s->ucmp->Compare(parsed_key.user_key, s->user_key) == 0) {
-      uint64_t offset = DecodeFixed64(v.data());
-      if (offset < s->vlog_->ValidTail() || offset > s->vlog_->ValidHead()) {
-        s->state = kDeleted;
-      } else {
-        s->state = (parsed_key.type == kTypeValue) ? kFound : kDeleted;
-      }
-      if (s->state == kFound) {
-        s->vlog_->Get(offset, s->value);
-      }
+      s->state = (parsed_key.type == kTypeValue) ? kFound : kDeleted;
+      s->value_ = v;
     }
   }
 }
 
+static void SaveValue(void* arg, const Slice& decode_blob_offset,
+                      const Slice& v) {
+  Saver* s = reinterpret_cast<Saver*>(arg);
+  s->value->assign(v.data(), v.size());
+}
+
 static bool NewestFirst(FileMetaData* a, FileMetaData* b) {
   return a->number > b->number;
+}
+
+static void GetBlobFileNumber(uint64_t* blob_number, const Slice& v) {
+  *blob_number = DecodeFixed64(v.data());
 }
 
 void Version::ForEachOverlapping(Slice user_key, Slice internal_key, void* arg,
@@ -361,6 +370,17 @@ Status Version::Get(const ReadOptions& options, const LookupKey& k,
     Status s;
     bool found;
 
+    Slice decode_blob_offset;
+
+    static Status SearchBlobFile(void* arg, uint64_t file_number,
+                                 uint64_t file_size) {
+      State* state = reinterpret_cast<State*>(arg);
+
+      state->s = state->vset->blob_cache_->Get(
+          *state->options, file_number, file_size, state->decode_blob_offset,
+          &state->saver, SaveValue);
+    }
+
     static bool Match(void* arg, int level, FileMetaData* f) {
       State* state = reinterpret_cast<State*>(arg);
 
@@ -376,7 +396,19 @@ Status Version::Get(const ReadOptions& options, const LookupKey& k,
 
       state->s = state->vset->table_cache_->Get(*state->options, f->number,
                                                 f->file_size, state->ikey,
-                                                &state->saver, SaveValue);
+                                                &state->saver, GetValueState);
+      if (state->saver.state == kFound) {
+        uint64_t blob_number = 0;
+        uint64_t blob_file_size = 0;
+        const char* ptr = state->saver.value_.data();
+        blob_number = DecodeFixed64(ptr);
+        state->decode_blob_offset =
+            Slice(ptr + sizeof(uint64_t), sizeof(uint64_t));
+        blob_file_size = DecodeFixed64(ptr + 2 * sizeof(uint64_t));
+        SearchBlobFile(reinterpret_cast<void*>(state), blob_number,
+                       blob_file_size);
+      }
+
       if (!state->s.ok()) {
         state->found = true;
         return false;
@@ -416,7 +448,6 @@ Status Version::Get(const ReadOptions& options, const LookupKey& k,
   state.saver.ucmp = vset_->icmp_.user_comparator();
   state.saver.user_key = k.user_key();
   state.saver.value = value;
-  state.saver.vlog_ = vset_->vlog_;
 
   ForEachOverlapping(state.saver.user_key, state.ikey, &state, &State::Match);
 
@@ -612,10 +643,15 @@ class VersionSet::Builder {
     std::set<uint64_t> deleted_files;
     FileSet* added_files;
   };
+  struct BlobState {
+    std::set<uint64_t> deleted_files;
+    std::vector<BlobFileMetaData*> added_files;
+  };
 
   VersionSet* vset_;
   Version* base_;
   LevelState levels_[config::kNumLevels];
+  BlobState blob_state_;
 
  public:
   // Initialize a builder with the files from *base and other info from *vset
@@ -690,6 +726,15 @@ class VersionSet::Builder {
       levels_[level].deleted_files.erase(f->number);
       levels_[level].added_files->insert(f);
     }
+
+    for (const auto& blob_number : edit->deleted_blob_files_) {
+      blob_state_.deleted_files.insert({blob_number});
+    }
+    for (const auto& blob_meta : edit->blob_files_) {
+      BlobFileMetaData* meta = new BlobFileMetaData(blob_meta);
+      meta->refs = 1;
+      blob_state_.added_files.emplace_back(meta);
+    }
   }
 
   // Save the current state in *v.
@@ -720,6 +765,8 @@ class VersionSet::Builder {
         MaybeAddFile(v, level, *base_iter);
       }
 
+      MaybeAddBlobFile(v);
+
 #ifndef NDEBUG
       // Make sure there is no overlap in levels > 0
       if (level > 0) {
@@ -735,6 +782,17 @@ class VersionSet::Builder {
         }
       }
 #endif
+    }
+  }
+
+  void MaybeAddBlobFile(Version* v) {
+    for (auto& blob_meta : blob_state_.added_files) {
+      if (blob_state_.deleted_files.count(blob_meta->number) > 0) {
+      } else {
+        std::vector<BlobFileMetaData*>& blob_files = v->blob_file_;
+        blob_meta->refs++;
+        blob_files.emplace_back(blob_meta);
+      }
     }
   }
 
@@ -755,23 +813,24 @@ class VersionSet::Builder {
 };
 
 VersionSet::VersionSet(const std::string& dbname, const Options* options,
-                       TableCache* table_cache,
-                       const InternalKeyComparator* cmp, VLog* vlog)
+                       BasicCache* table_cache, BasicCache* blob_cache,
+                       const InternalKeyComparator* cmp)
     : env_(options->env),
       dbname_(dbname),
       options_(options),
       table_cache_(table_cache),
+      blob_cache_(blob_cache),
       icmp_(*cmp),
       next_file_number_(2),
       manifest_file_number_(0),  // Filled by Recover()
       last_sequence_(0),
       log_number_(0),
       prev_log_number_(0),
+      blob_number_(0),
       descriptor_file_(nullptr),
       descriptor_log_(nullptr),
       dummy_versions_(this),
-      current_(nullptr),
-      vlog_(vlog) {
+      current_(nullptr) {
   AppendVersion(new Version(this));
 }
 
@@ -892,7 +951,8 @@ Status VersionSet::Recover(bool* save_manifest) {
     }
   };
 
-  // Read "CURRENT" file, which contains a pointer to the current manifest file
+  // Read "CURRENT" file, which contains a pointer to the current manifest
+  // file
   std::string current;
   Status s = ReadFileToString(env_, CurrentFileName(dbname_), &current);
   if (!s.ok()) {
@@ -1369,20 +1429,21 @@ FileMetaData* FindSmallestBoundaryFile(
   return smallest_boundary_file;
 }
 
-// Extracts the largest file b1 from |compaction_files| and then searches for a
-// b2 in |level_files| for which user_key(u1) = user_key(l2). If it finds such a
-// file b2 (known as a boundary file) it adds it to |compaction_files| and then
-// searches again using this new upper bound.
+// Extracts the largest file b1 from |compaction_files| and then searches for
+// a b2 in |level_files| for which user_key(u1) = user_key(l2). If it finds
+// such a file b2 (known as a boundary file) it adds it to |compaction_files|
+// and then searches again using this new upper bound.
 //
 // If there are two blocks, b1=(l1, u1) and b2=(l2, u2) and
 // user_key(u1) = user_key(l2), and if we compact b1 but not b2 then a
 // subsequent get operation will yield an incorrect result because it will
-// return the record from b2 in level i rather than from b1 because it searches
-// level by level for records matching the supplied user key.
+// return the record from b2 in level i rather than from b1 because it
+// searches level by level for records matching the supplied user key.
 //
 // parameters:
 //   in     level_files:      List of files to search for boundary files.
-//   in/out compaction_files: List of files to extend by adding boundary files.
+//   in/out compaction_files: List of files to extend by adding boundary
+//   files.
 void AddBoundaryInputs(const InternalKeyComparator& icmp,
                        const std::vector<FileMetaData*>& level_files,
                        std::vector<FileMetaData*>* compaction_files) {

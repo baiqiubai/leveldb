@@ -20,6 +20,8 @@
 #include "port/port.h"
 #include "port/thread_annotations.h"
 
+#include "blob/drop_entries_collector.h"
+
 namespace leveldb {
 
 namespace detail {
@@ -27,13 +29,12 @@ pid_t gettid();
 
 }  // namespace detail
 class MemTable;
-class TableCache;
+class BasicCache;
 class Version;
 class VersionEdit;
 class VersionSet;
-class VLog;
-class Prefetcher;
-class FileMetaData;
+struct FileMetaData;
+struct BlobFileMetaData;
 
 class DBImpl : public DB {
  public:
@@ -51,10 +52,9 @@ class DBImpl : public DB {
   Status Write(const WriteOptions& options, WriteBatch* updates) override;
   Status Get(const ReadOptions& options, const Slice& key,
              std::string* value) override;
-  Status ScanCountOfValue(const ReadOptions&, const Slice& start,
-                          uint32_t count,
-                          std::vector<std::string>* result) override;
-  Status ScanCountOfKV(
+  Status ScanNumOfValue(const ReadOptions&, const Slice& start, uint32_t count,
+                        std::vector<std::string>* result) override;
+  Status ScanNumOfEntries(
       const ReadOptions&, const Slice& start, uint32_t count,
       std::vector<std::pair<std::string, std::string>>* result) override;
 
@@ -90,18 +90,6 @@ class DBImpl : public DB {
   // Samples are taken approximately once every config::kReadBytesPeriod
   // bytes.
   void RecordReadSample(Slice key);
-
-  std::string GetName() const;
-
-  Status StartGC();
-
-  VLog* GetVLog();
-
-  void CompactEntryList(
-      const std::vector<std::pair<std::string, std::string>>& lists);
-
-  void AddSequenceNumberInKeys(
-      std::vector<std::pair<std::string, std::string>>* lists);
 
  private:
   friend class DB;
@@ -142,11 +130,6 @@ class DBImpl : public DB {
   Status Scan(const ReadOptions&, const Slice& start, const Slice& end,
               std::vector<std::string>* result, bool is_forward_scan = true);
 
-  Status HelperScanCountOfKV(
-      const ReadOptions&, const Slice& start, uint32_t count,
-      std::vector<std::string>* values, bool get_kv = false,
-      std::vector<std::pair<std::string, std::string>>* result = nullptr);
-
   // Recover the descriptor from persistent storage.  May do a significant
   // amount of work to recover recently logged updates.  Any changes to
   // be made to the descriptor are added to *edit.
@@ -167,9 +150,7 @@ class DBImpl : public DB {
                         VersionEdit* edit, SequenceNumber* max_sequence)
       EXCLUSIVE_LOCKS_REQUIRED(mutex_);
 
-  Status WriteLevel0Table(
-      MemTable* mem, VersionEdit* edit, Version* base,
-      const std::vector<std::pair<std::string, std::string>>& lists = {});
+  Status WriteLevel0Table(MemTable* mem, VersionEdit* edit, Version* base);
 
   EXCLUSIVE_LOCKS_REQUIRED(mutex_);
 
@@ -191,7 +172,10 @@ class DBImpl : public DB {
       EXCLUSIVE_LOCKS_REQUIRED(mutex_);
 
   Status OpenCompactionOutputFile(CompactionState* compact);
-  Status FinishCompactionOutputFile(CompactionState* compact, Iterator* input);
+  Status FinishCompaction(CompactionState* compact, Iterator* input);
+  Status FinishCompactionOutputFile(CompactionState* compact,
+                                    bool is_compact_blob_file = true,
+                                    Iterator* input = nullptr);
   Status InstallCompactionResults(CompactionState* compact)
       EXCLUSIVE_LOCKS_REQUIRED(mutex_);
 
@@ -199,7 +183,8 @@ class DBImpl : public DB {
     return internal_comparator_.user_comparator();
   }
 
-  void PickLevel(VersionEdit* edit, Version* base, const FileMetaData& meta);
+  Status StartGC(const std::unordered_set<uint64_t>& dircard_blob_list,
+                 VersionEdit* edit);
 
   // Constant after construction
   Env* const env_;
@@ -211,7 +196,8 @@ class DBImpl : public DB {
   const std::string dbname_;
 
   // table_cache_ provides its own synchronization
-  TableCache* const table_cache_;
+  BasicCache* const table_cache_;
+  BasicCache* const blob_cache_;
 
   // Lock over the persistent DB state.  Non-null iff successfully acquired.
   FileLock* db_lock_;
@@ -243,15 +229,9 @@ class DBImpl : public DB {
 
   ManualCompaction* manual_compaction_ GUARDED_BY(mutex_);
 
-  std::unique_ptr<VLog> vlog_ GUARDED_BY(mutex_);
-
   VersionSet* const versions_ GUARDED_BY(mutex_);
 
-  std::unique_ptr<Prefetcher> prefetcher_
-      GUARDED_BY(mutex_);  //必须在versionset前析构 需要清除所有iter
-
-  bool has_major_compact_ GUARDED_BY(mutex_);
-
+  std::unique_ptr<DropEntriesCollector> collector_;
   // Have we encountered a background error in paranoid mode?
   Status bg_error_ GUARDED_BY(mutex_);
 
