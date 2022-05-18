@@ -71,6 +71,12 @@ Slice MemTableIterator::value() const {
 
 Status MemTableIterator::status() const { return Status::OK(); }
 
+Iterator* MemTableIterator::current() const { return nullptr; }
+
+uint64_t MemTableIterator::GetBlobNumber() const { return 0; }
+
+uint64_t MemTableIterator::GetBlobSize() const { return 0; }
+
 Iterator* MemTable::NewIterator() { return new MemTableIterator(&table_); }
 
 void MemTable::Add(SequenceNumber s, ValueType type, const Slice& key,

@@ -105,6 +105,12 @@ class MemTableIterator : public Iterator {
 
   Status status() const override;
 
+  Iterator* current() const override;
+
+  uint64_t GetBlobNumber() const override;
+
+  uint64_t GetBlobSize() const override;
+
  private:
   MemTable::Table::Iterator iter_;
   std::string tmp_;  // For passing to EncodeKey

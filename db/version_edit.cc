@@ -5,6 +5,7 @@
 #include "db/version_edit.h"
 
 #include "db/version_set.h"
+
 #include "util/coding.h"
 
 namespace leveldb {
@@ -19,8 +20,9 @@ enum Tag {
   kCompactPointer = 5,
   kDeletedFile = 6,
   kNewFile = 7,
-  // 8 was used for large value refs
-  kPrevLogNumber = 9
+  kNewBlobFile = 8,
+  kDeletedBlobFile = 9,
+  kPrevLogNumber = 10
 };
 
 void VersionEdit::Clear() {
@@ -35,7 +37,9 @@ void VersionEdit::Clear() {
   has_next_file_number_ = false;
   has_last_sequence_ = false;
   deleted_files_.clear();
+  deleted_blob_files_.clear();
   new_files_.clear();
+  blob_files_.clear();
 }
 
 void VersionEdit::EncodeTo(std::string* dst) const {
@@ -81,6 +85,18 @@ void VersionEdit::EncodeTo(std::string* dst) const {
     PutLengthPrefixedSlice(dst, f.smallest.Encode());
     PutLengthPrefixedSlice(dst, f.largest.Encode());
   }
+
+  for (const auto& blob_number : deleted_blob_files_) {
+    PutVarint32(dst, kDeletedBlobFile);
+    PutVarint64(dst, blob_number);
+  }
+
+  for (size_t i = 0; i < blob_files_.size(); ++i) {
+    const BlobFileMetaData& f = blob_files_[i];
+    PutVarint32(dst, kNewBlobFile);
+    PutVarint64(dst, f.number);
+    PutVarint64(dst, f.file_size);
+  }
 }
 
 static bool GetInternalKey(Slice* input, InternalKey* dst) {
@@ -112,6 +128,7 @@ Status VersionEdit::DecodeFrom(const Slice& src) {
   int level;
   uint64_t number;
   FileMetaData f;
+  BlobFileMetaData blob_meta;
   Slice str;
   InternalKey key;
 
@@ -184,7 +201,21 @@ Status VersionEdit::DecodeFrom(const Slice& src) {
           msg = "new-file entry";
         }
         break;
-
+      case kDeletedBlobFile:
+        if (GetVarint64(&input, &blob_meta.number)) {
+          deleted_blob_files_.insert({blob_meta.number});
+        } else {
+          msg = "deleted blob file";
+        }
+        break;
+      case kNewBlobFile:
+        if (GetVarint64(&input, &blob_meta.number) &&
+            GetVarint64(&input, &blob_meta.file_size)) {
+          blob_files_.emplace_back(blob_meta);
+        } else {
+          msg = "new-blob file entry";
+        }
+        break;
       default:
         msg = "unknown tag";
         break;
@@ -249,6 +280,16 @@ std::string VersionEdit::DebugString() const {
     r.append(f.smallest.DebugString());
     r.append(" .. ");
     r.append(f.largest.DebugString());
+  }
+  for (const auto& blob_number : deleted_blob_files_) {
+    r.append("\n RemoveBlobFile: ");
+    AppendNumberTo(&r, blob_number);
+  }
+  for (const auto& blob_meta : blob_files_) {
+    r.append("\n AddBlobFile: ");
+    AppendNumberTo(&r, blob_meta.number);
+    r.append(" ");
+    AppendNumberTo(&r, blob_meta.file_size);
   }
   r.append("\n}\n");
   return r;

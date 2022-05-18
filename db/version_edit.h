@@ -5,11 +5,10 @@
 #ifndef STORAGE_LEVELDB_DB_VERSION_EDIT_H_
 #define STORAGE_LEVELDB_DB_VERSION_EDIT_H_
 
+#include "db/dbformat.h"
 #include <set>
 #include <utility>
 #include <vector>
-
-#include "db/dbformat.h"
 
 namespace leveldb {
 
@@ -24,6 +23,14 @@ struct FileMetaData {
   uint64_t file_size;    // File size in bytes
   InternalKey smallest;  // Smallest internal key served by table
   InternalKey largest;   // Largest internal key served by table
+};
+
+struct BlobFileMetaData {
+  BlobFileMetaData() : refs(0), file_size(0) {}
+
+  int refs;
+  uint64_t number;
+  uint64_t file_size;
 };
 
 class VersionEdit {
@@ -70,9 +77,20 @@ class VersionEdit {
     new_files_.push_back(std::make_pair(level, f));
   }
 
+  void AddBlobFile(uint64_t file_number, uint64_t file_size) {
+    BlobFileMetaData f;
+    f.number = file_number;
+    f.file_size = file_size;
+    blob_files_.emplace_back(f);
+  }
+
   // Delete the specified "file" from the specified "level".
   void RemoveFile(int level, uint64_t file) {
     deleted_files_.insert(std::make_pair(level, file));
+  }
+
+  void RemoveBlobFile(uint64_t file_number) {
+    deleted_blob_files_.insert({file_number});
   }
 
   void EncodeTo(std::string* dst) const;
@@ -84,6 +102,7 @@ class VersionEdit {
   friend class VersionSet;
 
   typedef std::set<std::pair<int, uint64_t>> DeletedFileSet;
+  typedef std::set<uint64_t> DeletedBlobFileSet;
 
   std::string comparator_;
   uint64_t log_number_;
@@ -98,7 +117,9 @@ class VersionEdit {
 
   std::vector<std::pair<int, InternalKey>> compact_pointers_;
   DeletedFileSet deleted_files_;
+  DeletedBlobFileSet deleted_blob_files_;
   std::vector<std::pair<int, FileMetaData>> new_files_;
+  std::vector<BlobFileMetaData> blob_files_;
 };
 
 }  // namespace leveldb
