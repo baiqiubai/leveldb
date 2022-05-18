@@ -25,6 +25,11 @@ Iterator::~Iterator() {
 
 Iterator* Iterator::current() const { return nullptr; }
 
+// invalid blob number
+uint64_t Iterator::GetBlobNumber() const { return 0; }
+
+uint64_t Iterator::GetBlobSize() const { return 0; }
+
 void Iterator::RegisterCleanup(CleanupFunction func, void* arg1, void* arg2) {
   assert(func != nullptr);
   CleanupNode* node;
@@ -62,6 +67,12 @@ class EmptyIterator : public Iterator {
     return Slice();
   }
   Status status() const override { return status_; }
+
+  Iterator* current() const override { return nullptr; }
+
+  uint64_t GetBlobNumber() const override { return 0; }
+
+  uint64_t GetBlobSize() const override { return 0; }
 
  private:
   Status status_;
