@@ -148,11 +148,11 @@ class LEVELDB_EXPORT DB {
   virtual void CompactRange(const Slice* begin, const Slice* end) = 0;
 
   //扫描从start开始的count个k-v对 如果没有出错结果放入result中
-  virtual Status ScanCountOfValue(const ReadOptions&, const Slice& start,
-                                  uint32_t count,
-                                  std::vector<std::string>* result) = 0;
+  virtual Status ScanNumOfValue(const ReadOptions&, const Slice& start,
+                                uint32_t count,
+                                std::vector<std::string>* result) = 0;
 
-  virtual Status ScanCountOfKV(
+  virtual Status ScanNumOfEntries(
       const ReadOptions&, const Slice& start, uint32_t count,
       std::vector<std::pair<std::string, std::string>>* result) = 0;
 
@@ -166,9 +166,6 @@ class LEVELDB_EXPORT DB {
   virtual Status BackwardScan(const ReadOptions&, const Slice& start,
                               const Slice& end,
                               std::vector<std::string>* result) = 0;
-  // virtual std::string GetName() const = 0;
-
-  //  virtual Status StartGC() = 0;
 };
 
 // Destroy the contents of the specified database.

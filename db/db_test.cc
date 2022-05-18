@@ -25,10 +25,10 @@
 #include "util/hash.h"
 #include "util/logging.h"
 #include "util/mutexlock.h"
-#include "util/prefetcher.h"
 #include "util/testutil.h"
 
 #include "benchmark/benchmark.h"
+#include "blob/prefetcher.h"
 #include "gtest/gtest.h"
 
 namespace leveldb {
@@ -320,7 +320,6 @@ class DBTest : public testing::Test {
     last_options_ = opts;
 
     Status s = DB::Open(opts, dbname_, &db_);
-    parsed_.reset(new ParseIteratorValue(dbfull()->GetVLog()));
 
     return s;
   }
@@ -411,9 +410,6 @@ class DBTest : public testing::Test {
               if (is_memtable) {
                 result += iter->value().ToString();
               } else {
-                ParseIteratorValue parse_value(dbfull()->GetVLog());
-                parse_value.Parse(iter->value());
-                result += parse_value.GetValue();
               }
             } break;
             case kTypeDeletion:

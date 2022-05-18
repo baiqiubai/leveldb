@@ -74,6 +74,10 @@ class LEVELDB_EXPORT Iterator {
 
   virtual Iterator* current() const;
 
+  virtual uint64_t GetBlobNumber() const;
+
+  virtual uint64_t GetBlobSize() const;
+
   // Clients are allowed to register function/arg1/arg2 triples that
   // will be invoked when this iterator is destroyed.
   //
