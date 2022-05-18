@@ -26,14 +26,14 @@ enum FileType {
   kDescriptorFile,
   kCurrentFile,
   kTempFile,
-  kVLog,
+  kBlobFile,
   kInfoLogFile  // Either the current one, or an old one
 };
 
 static const std::string FileTypeMap[] = {
     "kLogFile",        "kDBLockFile",  "kTableFile",
     "kDescriptorFile", "kCurrentFile", "kTempFile",
-    "kVLog",           "kInfoLogFile"
+    "kBlobFile",       "kInfoLogFile"
 
 };
 
@@ -76,9 +76,7 @@ std::string InfoLogFileName(const std::string& dbname);
 // Return the name of the old info log file for "dbname".
 std::string OldInfoLogFileName(const std::string& dbname);
 
-std::string vLogFileName(const std::string& dbname);
-
-std::string vLogValidIntervalFileName(const std::string& dbname);
+std::string BlobFileName(const std::string& dbname, uint64_t number);
 
 // If filename is a leveldb file, store the type of the file in *type.
 // The number encoded in the filename is stored in *number.  If the
