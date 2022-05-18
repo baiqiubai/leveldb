@@ -30,6 +30,8 @@ enum CompressionType {
   kSnappyCompression = 0x1
 };
 
+enum GCPolicy { kUseDiscardSize = 0x0, kUseDeleteNum = 0x1 };
+
 // Options to control the behavior of a database (passed to DB::Open)
 struct LEVELDB_EXPORT Options {
   // Create an Options object with default values for all fields.
@@ -129,8 +131,7 @@ struct LEVELDB_EXPORT Options {
   // worth switching to kNoCompression.  Even if the input data is
   // incompressible, the kSnappyCompression implementation will
   // efficiently detect that and will switch to uncompressed mode.
-  CompressionType compression = kSnappyCompression;
-
+  CompressionType compression = kNoCompression;
   // EXPERIMENTAL: If true, append to existing MANIFEST and log files
   // when a database is opened.  This can significantly speed up open.
   //
@@ -143,6 +144,10 @@ struct LEVELDB_EXPORT Options {
   const FilterPolicy* filter_policy = nullptr;
 
   bool enable_garbage_collection = true;
+
+  GCPolicy gc_policy;
+
+  double gc_threshold_ratio = 0.3;
 };
 
 // Options that control read operations
