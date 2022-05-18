@@ -142,8 +142,6 @@ target_sources(leveldb
     "db/memtable.h"
     "db/skiplist.h"
     "db/snapshot.h"
-    "db/table_cache.cc"
-    "db/table_cache.h"
     "db/version_edit.cc"
     "db/version_edit.h"
     "db/version_set.cc"
@@ -161,8 +159,6 @@ target_sources(leveldb
     "table/filter_block.h"
     "table/format.cc"
     "table/format.h"
-    "table/vlog_format.h"
-    "table/vlog_format.cc"
     "table/iterator_wrapper.h"
     "table/iterator.cc"
     "table/merger.cc"
@@ -191,10 +187,18 @@ target_sources(leveldb
     "util/options.cc"
     "util/random.h"
     "util/status.cc"
-    "util/prefetcher.h"
-    "util/prefetcher.cc"
-    "util/threadpool.h"
-    "util/threadpool.cc"
+    "blob/prefetcher.h"
+    "blob/prefetcher.cc"
+    "blob/threadpool.h"
+    "blob/threadpool.cc"
+    "blob/basic_cache.h"
+    "blob/basic_cache.cc"
+    "blob/blob.cc"
+    "blob/blob.h"
+    "blob/blob_builder.h"
+    "blob/blob_builder.cc"
+    "blob/drop_entries_collector.h"
+    "blob/drop_entries_collector.cc"
 
   # Only CMake 3.3+ supports PUBLIC sources in targets exported by "install".
   $<$<VERSION_GREATER:CMAKE_VERSION,3.2>:PUBLIC>
@@ -372,7 +376,6 @@ if(LEVELDB_BUILD_TESTS)
 
     leveldb_test("table/filter_block_test.cc")
     leveldb_test("table/table_test.cc")
-    leveldb_test("table/vlog_format_test.cc")
 
     leveldb_test("util/arena_test.cc")
     leveldb_test("util/bloom_test.cc")

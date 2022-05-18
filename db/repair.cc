@@ -31,13 +31,14 @@
 #include "db/log_reader.h"
 #include "db/log_writer.h"
 #include "db/memtable.h"
-#include "db/table_cache.h"
 #include "db/version_edit.h"
 #include "db/write_batch_internal.h"
 
 #include "leveldb/comparator.h"
 #include "leveldb/db.h"
 #include "leveldb/env.h"
+
+#include "blob/basic_cache.h"
 
 namespace leveldb {
 
@@ -202,14 +203,14 @@ class Repairer {
     // Do not record a version edit for this conversion to a Table
     // since ExtractMetaData() will also generate edits.
     FileMetaData meta;
+    BlobFileMetaData blob_meta;
     meta.number = next_file_number_++;
 
     // TODO
-    VLog* vlog = nullptr;
 
     Iterator* iter = mem->NewIterator();
-    status =
-        BuildTable(dbname_, env_, options_, table_cache_, iter, &meta, vlog);
+    status = BuildTable(dbname_, env_, options_, table_cache_, iter, &meta,
+                        &blob_meta);
     delete iter;
     mem->Unref();
     mem = nullptr;

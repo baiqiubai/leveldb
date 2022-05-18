@@ -72,11 +72,11 @@ static int FLAGS_reads = -1;
 static int FLAGS_threads = 1;
 
 // Size of each value
-static int FLAGS_value_size = 1024;
+static int FLAGS_value_size = 100;
 
 // Arrange to generate values that shrink to this fraction of
 // their original size after compression
-static double FLAGS_compression_ratio = 0.5;
+static double FLAGS_compression_ratio = 1;
 
 // Print histogram of operation timings
 static bool FLAGS_histogram = false;
@@ -824,7 +824,7 @@ class Benchmark {
     int i = 0;
     int64_t bytes = 0;
     std::vector<std::pair<std::string, std::string>> kv;
-    Status s = db_->ScanCountOfKV(ReadOptions(), Slice(), reads_, &kv);
+    Status s = db_->ScanNumOfEntries(ReadOptions(), Slice(), reads_, &kv);
     assert(s.ok());
     for (auto& [k, v] : kv) {
       bytes += k.size() + v.size();
