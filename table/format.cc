@@ -5,6 +5,7 @@
 #include "table/format.h"
 
 #include "leveldb/env.h"
+
 #include "port/port.h"
 #include "table/block.h"
 #include "util/coding.h"
@@ -46,7 +47,7 @@ Status Footer::DecodeFrom(Slice* input) {
   const uint64_t magic = ((static_cast<uint64_t>(magic_hi) << 32) |
                           (static_cast<uint64_t>(magic_lo)));
   if (magic != kTableMagicNumber) {
-    return Status::Corruption("not an sstable (bad magic number)");
+    return Status::Corruption("not an Blob (bad magic number)");
   }
 
   Status result = metaindex_handle_.DecodeFrom(input);
@@ -59,6 +60,80 @@ Status Footer::DecodeFrom(Slice* input) {
     *input = Slice(end, input->data() + input->size() - end);
   }
   return result;
+}
+
+void BlobFooter::EncodeTo(std::string* dst) const {
+  const size_t original_size = dst->size();
+  data_handle_.EncodeTo(dst);
+  dst->resize(BlockHandle::kMaxEncodedLength);
+  PutFixed32(dst, static_cast<uint32_t>(kTableMagicNumber & 0xffffffffu));
+  PutFixed32(dst, static_cast<uint32_t>(kTableMagicNumber >> 32));
+  assert(dst->size() == original_size + kEncodedLength);
+  (void)original_size;  // Disable unused variable warning.
+}
+
+Status BlobFooter::DecodeFrom(Slice* input) {
+  const char* magic_ptr = input->data() + kEncodedLength - 8;
+  const uint32_t magic_lo = DecodeFixed32(magic_ptr);
+  const uint32_t magic_hi = DecodeFixed32(magic_ptr + 4);
+  const uint64_t magic = ((static_cast<uint64_t>(magic_hi) << 32) |
+                          (static_cast<uint64_t>(magic_lo)));
+  if (magic != kTableMagicNumber) {
+    return Status::Corruption("not an sstable (bad magic number)");
+  }
+
+  Status result = data_handle_.DecodeFrom(input);
+  if (result.ok()) {
+    // We skip over any leftover data (just padding for now) in "input"
+    const char* end = magic_ptr + 8;
+    *input = Slice(end, input->data() + input->size() - end);
+  }
+  return result;
+}
+
+Slice GetCompressBlock(const Slice& raw_contents, CompressionType* type,
+                       std::string* compressed) {
+  Slice block_contents;
+  switch (*type) {
+    case kNoCompression:
+      block_contents = raw_contents;
+      break;
+
+    case kSnappyCompression: {
+      if (port::Snappy_Compress(raw_contents.data(), raw_contents.size(),
+                                compressed) &&
+          compressed->size() <
+              raw_contents.size() - (raw_contents.size() / 8u)) {
+        block_contents = *compressed;
+      } else {
+        // Snappy not supported, or compressed less than 12.5%, so just
+        // store uncompressed form
+        block_contents = raw_contents;
+        *type = kNoCompression;
+      }
+      break;
+    }
+  }
+  return block_contents;
+}
+
+void WriteRawBlock(const Slice& block_contents, WritableFile* file,
+                   CompressionType type, BlockHandle* handle,
+                   uint64_t* offset) {
+  handle->set_offset(*offset);
+  handle->set_size(block_contents.size());
+  Status status = file->Append(block_contents);
+  if (status.ok()) {
+    char trailer[kBlockTrailerSize];
+    trailer[0] = type;
+    uint32_t crc = crc32c::Value(block_contents.data(), block_contents.size());
+    crc = crc32c::Extend(crc, trailer, 1);  // Extend crc to cover block type
+    EncodeFixed32(trailer + 1, crc32c::Mask(crc));
+    status = file->Append(Slice(trailer, kBlockTrailerSize));
+    if (status.ok()) {
+      *offset += block_contents.size() + kBlockTrailerSize;
+    }
+  }
 }
 
 Status ReadBlock(RandomAccessFile* file, const ReadOptions& options,

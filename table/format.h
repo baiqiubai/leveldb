@@ -70,6 +70,22 @@ class Footer {
   BlockHandle index_handle_;
 };
 
+class BlobFooter {
+ public:
+  enum { kEncodedLength = BlockHandle::kMaxEncodedLength + 8 };
+
+  BlobFooter() = default;
+
+  const BlockHandle& data_handle() const { return data_handle_; }
+  void set_data_handle(const BlockHandle& h) { data_handle_ = h; }
+
+  void EncodeTo(std::string* dst) const;
+  Status DecodeFrom(Slice* input);
+
+ private:
+  BlockHandle data_handle_;
+};
+
 // kTableMagicNumber was picked by running
 //    echo http://code.google.com/p/leveldb/ | sha1sum
 // and taking the leading 64 bits.
@@ -90,6 +106,12 @@ Status ReadBlock(RandomAccessFile* file, const ReadOptions& options,
                  const BlockHandle& handle, BlockContents* result);
 
 // Implementation details follow.  Clients should ignore,
+
+Slice GetCompressBlock(const Slice& raw_contents, CompressionType* type,
+                       std::string* compressed);
+
+void WriteRawBlock(const Slice& block_contents, WritableFile* file,
+                   CompressionType type, BlockHandle* handle, uint64_t* offset);
 
 inline BlockHandle::BlockHandle()
     : offset_(~static_cast<uint64_t>(0)), size_(~static_cast<uint64_t>(0)) {}
