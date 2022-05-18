@@ -79,10 +79,15 @@ class LEVELDB_EXPORT TableBuilder {
   // Finish() call, returns the size of the final generated file.
   uint64_t FileSize() const;
 
+  void SetBlobNumber(uint64_t blob_number);
+
+  void SetBlobSize(uint64_t blob_size);
+
  private:
   bool ok() const { return status().ok(); }
   void WriteBlock(BlockBuilder* block, BlockHandle* handle);
-  void WriteRawBlock(const Slice& data, CompressionType, BlockHandle* handle);
+
+  void WriteBlobState(std::string *encode_state);
 
   struct Rep;
   Rep* rep_;

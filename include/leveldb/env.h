@@ -375,6 +375,10 @@ class LEVELDB_EXPORT EnvWrapper : public Env {
   Status NewAppendableFile(const std::string& f, WritableFile** r) override {
     return target_->NewAppendableFile(f, r);
   }
+  Status NewRandomWriteFile(const std::string& f,
+                            RandomWriteFile** r) override {
+    return target_->NewRandomWriteFile(f, r);
+  }
   bool FileExists(const std::string& f) override {
     return target_->FileExists(f);
   }

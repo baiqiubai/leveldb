@@ -58,13 +58,9 @@ class LEVELDB_EXPORT Table {
   // be close to the file length.
   uint64_t ApproximateOffsetOf(const Slice& key) const;
 
- private:
-  friend class TableCache;
-  struct Rep;
+  uint64_t GetBlobNumber() const;
 
-  static Iterator* BlockReader(void*, const ReadOptions&, const Slice&);
-
-  explicit Table(Rep* rep) : rep_(rep) {}
+  uint64_t GetBlobSize() const;
 
   // Calls (*handle_result)(arg, ...) with the entry found after a call
   // to Seek(key).  May not make such a call if filter policy says
@@ -73,8 +69,18 @@ class LEVELDB_EXPORT Table {
                      void (*handle_result)(void* arg, const Slice& k,
                                            const Slice& v));
 
+ private:
+  friend class TableCache;
+  struct Rep;
+
+  static Iterator* BlockReader(void*, const ReadOptions&, const Slice&);
+
+  explicit Table(Rep* rep) : rep_(rep) {}
+
   void ReadMeta(const Footer& footer);
   void ReadFilter(const Slice& filter_handle_value);
+  static Status ReadBlobState(uint64_t size, RandomAccessFile* file,
+                              std::pair<uint64_t, uint64_t>* blob_state);
 
   Rep* const rep_;
 };
