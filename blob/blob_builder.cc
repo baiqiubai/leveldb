@@ -66,9 +66,10 @@ Status BlobBuilder::Finish() {
   CompressionType type = options_.compression;
   std::string compressed;
 
-  // Slice block_contents = GetCompressBlock(raw_contents, &type, &compressed);
   // do not compress
-  WriteRawBlock(raw_contents, file_, type, &pending_handle_, &offset_);
+  WriteRawBlock(raw_contents, file_, kNoCompression, &pending_handle_,
+                &offset_);
+  pending_handle_.set_offset(0);
   offset_ -= static_cast<uint64_t>(raw_contents.size());
   assert(offset_ == raw_contents.size() + kBlockTrailerSize);
   Status s = WriteFooter();
