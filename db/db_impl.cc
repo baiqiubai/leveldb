@@ -39,6 +39,7 @@
 #include "util/logging.h"
 #include "util/mutexlock.h"
 
+#include "ac-key/arc_cache.h"
 #include "blob/basic_cache.h"
 #include "blob/blob_builder.h"
 
@@ -80,11 +81,15 @@ struct DBImpl::CompactionState {
     return &outputs_blob_file[outputs_blob_file.size() - 1];
   }
 
+  void PopOutBlobFile() { outputs_blob_file.pop_back(); }
+
   explicit CompactionState(Compaction* c)
       : compaction(c),
         smallest_snapshot(0),
         outfile(nullptr),
         builder(nullptr),
+        blob_file(nullptr),
+        blob_builder(nullptr),
         total_bytes(0) {}
 
   Compaction* const compaction;
@@ -137,6 +142,7 @@ Options SanitizeOptions(const std::string& dbname,
   if (result.block_cache == nullptr) {
     result.block_cache = NewLRUCache(8 << 20);
   }
+
   return result;
 }
 
@@ -156,6 +162,7 @@ DBImpl::DBImpl(const Options& raw_options, const std::string& dbname)
       dbname_(dbname),
       table_cache_(new TableCache(dbname_, options_, TableCacheSize(options_))),
       blob_cache_(new BlobCache(dbname_, options_, TableCacheSize(options_))),
+      adaptive_cache_(NewARCCache(8 << 20)),
       db_lock_(nullptr),
       shutting_down_(false),
       background_work_finished_signal_(&mutex_),
@@ -170,21 +177,26 @@ DBImpl::DBImpl(const Options& raw_options, const std::string& dbname)
       background_compaction_scheduled_(false),
       manual_compaction_(nullptr),
       versions_(new VersionSet(dbname_, &options_, table_cache_, blob_cache_,
-                               &internal_comparator_)) {}
+                               adaptive_cache_, &internal_comparator_)),
+      collector_(new DropEntriesCollector(options_)),
+      prefetcher_(new Prefetcher(this, blob_cache_)),
+      parsed_offset_(new ParsedDBIterator(blob_cache_)) {}
+
 DBImpl::~DBImpl() {
   // Wait for background work to finish.
   mutex_.Lock();
   shutting_down_.store(true, std::memory_order_release);
-  Log(options_.info_log, "DB Destroy running...\n");
   while (background_compaction_scheduled_) {
     background_work_finished_signal_.Wait();
   }
   mutex_.Unlock();
-  Log(options_.info_log, "DB Destroy finished...\n");
 
   if (db_lock_ != nullptr) {
     env_->UnlockFile(db_lock_);
   }
+  prefetcher_.reset();
+  collector_.reset();
+  parsed_offset_.reset();
 
   delete versions_;
   if (mem_ != nullptr) mem_->Unref();
@@ -193,6 +205,8 @@ DBImpl::~DBImpl() {
   delete log_;
   delete logfile_;
   delete table_cache_;
+  delete blob_cache_;
+  delete adaptive_cache_;
 
   if (owns_info_log_) {
     delete options_.info_log;
@@ -202,34 +216,37 @@ DBImpl::~DBImpl() {
   }
 }
 
-Status DBImpl::ScanNumOfValue(const ReadOptions& options, const Slice& start,
+Status DBImpl::ScanNumOfValue(const ReadOptions& options, const Slice* start,
                               uint32_t count,
                               std::vector<std::string>* result) {
-  return Status::OK();
+  return prefetcher_->FetchValue(options, start, count, result);
 }
 
 Status DBImpl::ScanNumOfEntries(
-    const ReadOptions& options, const Slice& start, uint32_t count,
+    const ReadOptions& options, const Slice* start, uint32_t count,
     std::vector<std::pair<std::string, std::string>>* result) {
-  return Status::OK();
+  return prefetcher_->FetchEntries(options, start, count, result);
 }
 
-Status DBImpl::BackwardScan(const ReadOptions& options, const Slice& start,
-                            const Slice& end,
+Status DBImpl::BackwardScan(const ReadOptions& options, const Slice* start,
+                            const Slice* end,
                             std::vector<std::string>* result) {
   return Scan(options, start, end, result, false);
 }
 
-Status DBImpl::ForwardScan(const ReadOptions& options, const Slice& start,
-                           const Slice& end, std::vector<std::string>* result) {
+Status DBImpl::ForwardScan(const ReadOptions& options, const Slice* start,
+                           const Slice* end, std::vector<std::string>* result) {
   return Scan(options, start, end, result);
 }
 
-Status DBImpl::Scan(const ReadOptions& options, const Slice& start,
-                    const Slice& end, std::vector<std::string>* result,
+Status DBImpl::Scan(const ReadOptions& options, const Slice* start,
+                    const Slice* end, std::vector<std::string>* result,
                     bool is_forward_scan) {
-  return Status::OK();
+  return prefetcher_->FetchInterval(options, start, end, result,
+                                    is_forward_scan);
 }
+
+BlobCache* DBImpl::GetBlobCache() { return blob_cache_; }
 
 Status DBImpl::NewDB() {
   VersionEdit new_db;
@@ -573,13 +590,12 @@ Status DBImpl::WriteLevel0Table(MemTable* mem, VersionEdit* edit,
 
   Log(options_.info_log, "Level-0 table #%llu: started",
       (unsigned long long)meta.number);
-
   Status s;
   {
     mutex_.Unlock();
     if (s.ok()) {
       s = BuildTable(dbname_, env_, options_, table_cache_, iter, &meta,
-                     &blob_meta);
+                     &blob_meta, &adaptive_cache_);
     }
     mutex_.Lock();
   }
@@ -593,7 +609,7 @@ Status DBImpl::WriteLevel0Table(MemTable* mem, VersionEdit* edit,
   // Note that if file_size is zero, the file has been deleted and
   // should not be added to the manifest.
   int level = 0;
-  if (s.ok() && meta.file_size > 0 && blob_meta.file_size > 0) {
+  if (s.ok() && meta.file_size > 0) {
     const Slice min_user_key = meta.smallest.user_key();
     const Slice max_user_key = meta.largest.user_key();
     if (base != nullptr) {
@@ -601,15 +617,20 @@ Status DBImpl::WriteLevel0Table(MemTable* mem, VersionEdit* edit,
     }
     edit->AddFile(level, meta.number, meta.file_size, meta.smallest,
                   meta.largest);
-    edit->AddBlobFile(blob_meta.number, blob_meta.file_size);
   }
 
   CompactionStats stats;
   stats.micros = env_->NowMicros() - start_micros;
   stats.bytes_written = meta.file_size;
   stats_[level].Add(stats);
-  Log(options_.info_log, "Pick table#%llu in level-%d",
-      (unsigned long long)meta.number, level);
+  if (blob_meta.file_size != kInValidBlobFileSize) {
+    Log(options_.info_log, "Pick table#%llu in level-%d,Blob number%llu ",
+        (unsigned long long)meta.number, level,
+        (unsigned long long)blob_meta.number);
+  } else {
+    Log(options_.info_log, "Pick table#%llu in level-%d",
+        (unsigned long long)meta.number, level);
+  }
   return s;
 }
 
@@ -769,20 +790,45 @@ void DBImpl::BackgroundCall() {
   background_work_finished_signal_.SignalAll();
 }
 
+Status DBImpl::InsertBlobToCache(
+    const std::unordered_map<uint64_t, uint64_t>& blob_list) {
+  Log(options_.info_log, "Discard Blob File Size:%ld", blob_list.size());
+  for (auto& [blob_number, blob_file_size] : blob_list) {
+    Iterator* iter = blob_cache_->NewIterator(ReadOptions(), blob_number,
+                                              blob_file_size, nullptr);
+    delete iter;  // refs-- 会转移到lru表
+  }
+  return Status::OK();
+}
+
 void DBImpl::
     MaybeScheduleGC() {  //根据collector收集到的信息判断去删除那个blobfile
   if (options_.enable_garbage_collection) {
     VersionEdit edit;
-    Status s = StartGC(collector_->GetDeleteBlobFileList(), &edit);
-    mutex_.Lock();
+    std::unordered_map<uint64_t, uint64_t> delete_blob_list =
+        collector_->GetDeleteBlobFileList();
+    //此处需要对于丢弃的blob文件插入cache中
+    //否则有可能前台正在blob_cache中查找blob 后台直接将其remove掉
+    //会导致查询不到blob 插入cache只有当最后一个引用消失才会彻底删除那个文件
+    Status s = InsertBlobToCache(delete_blob_list);
     if (s.ok()) {
-      s = versions_->LogAndApply(&edit, &mutex_);
+      s = StartGC(delete_blob_list, &edit);
+      if (s.ok()) {
+        mutex_.Lock();
+        edit.SetMaxBlobFileNumber(versions_->BlobFileNumber());
+        s = versions_->LogAndApply(&edit, &mutex_);
+      }
     }
   }
 }
 
-Status DBImpl::StartGC(const std::unordered_set<uint64_t>& discard_blob_list,
-                       VersionEdit* edit) {
+Status DBImpl::StartGC(
+    const std::unordered_map<uint64_t, uint64_t>& discard_blob_list,
+    VersionEdit* edit) {
+  if (discard_blob_list.size() == 0) {
+    return Status::Corruption("No need GC");
+  }
+
   std::vector<std::string> filenames;
   env_->GetChildren(dbname_, &filenames);  // Ignoring errors on purpose
   uint64_t number;
@@ -804,7 +850,6 @@ Status DBImpl::StartGC(const std::unordered_set<uint64_t>& discard_blob_list,
         if (type == kBlobFile) {
           blob_cache_->Evict(number);
         }
-        edit->AddBlobFile(number, 0);
         Log(options_.info_log, "Delete type=%s #%lld\n",
             FileTypeMap[type].data(), static_cast<unsigned long long>(number));
       }
@@ -817,6 +862,7 @@ Status DBImpl::StartGC(const std::unordered_set<uint64_t>& discard_blob_list,
   for (const std::string& filename : files_to_delete) {
     env_->RemoveFile(dbname_ + "/" + filename);
   }
+  return Status::OK();
 }
 void DBImpl::BackgroundCompaction() {
   mutex_.AssertHeld();
@@ -871,6 +917,8 @@ void DBImpl::BackgroundCompaction() {
       RecordBackgroundError(status);
     }
     CleanupCompaction(compact);
+    versions_->CleanGenerateBlobList();
+    collector_->Clear();
     c->ReleaseInputs();
     RemoveObsoleteFiles();
   }
@@ -932,13 +980,14 @@ Status DBImpl::OpenCompactionOutputFile(CompactionState* compact) {
     mutex_.Lock();
     file_number = versions_->NewFileNumber();
     blob_file_number = versions_->BlobFileNumber();
+    versions_->AddGenerateBlobNumber(blob_file_number);
     pending_outputs_.insert(file_number);
     CompactionState::Output out;
     CompactionState::OutputBlobFile blob_out;
     out.number = file_number;
     out.smallest.Clear();
     out.largest.Clear();
-    blob_out.number = file_number;
+    blob_out.number = blob_file_number;
     compact->outputs_blob_file.emplace_back(blob_out);
     compact->outputs.emplace_back(out);
     mutex_.Unlock();
@@ -959,9 +1008,21 @@ Status DBImpl::OpenCompactionOutputFile(CompactionState* compact) {
 }
 
 Status DBImpl::FinishCompaction(CompactionState* compact, Iterator* input) {
-  Status s = FinishCompactionOutputFile(compact);
+  bool blob_is_empty = false;
+  Status s =
+      FinishCompactionOutputFile(compact, true, nullptr, &blob_is_empty);  //
   if (s.ok()) {
-    compact->builder->SetBlobSize(compact->current_outputblobfile()->file_size);
+    if (!blob_is_empty) {
+      compact->builder->SetBlobSize(
+          compact->current_outputblobfile()->file_size);
+      compact->builder->SetBlobNumber(
+          compact->current_outputblobfile()->number);
+    } else {
+      std::string delete_blob_name =
+          BlobFileName(dbname_, compact->current_outputblobfile()->number);
+      env_->RemoveFile(delete_blob_name);
+      compact->PopOutBlobFile();
+    }
     s = FinishCompactionOutputFile(compact, false, input);
   }
   return s;
@@ -969,30 +1030,37 @@ Status DBImpl::FinishCompaction(CompactionState* compact, Iterator* input) {
 
 Status DBImpl::FinishCompactionOutputFile(CompactionState* compact,
                                           bool is_compact_blob_file,
-                                          Iterator* input) {
+                                          Iterator* input,
+                                          bool* blob_is_empty) {
   Status s;
   assert(compact != nullptr);
   if (is_compact_blob_file) {
-    assert(compact->outfile != nullptr);
-    assert(compact->builder != nullptr);
+    assert(compact->blob_builder != nullptr);
+    assert(compact->blob_file != nullptr);
 
-    s = compact->blob_builder->Finish();
+    if (compact->blob_builder->FileSize() == kInValidBlobFileSize) {
+      *blob_is_empty = true;
+    } else {
+      s = compact->blob_builder->Finish();
 
-    const uint64_t current_bytes = compact->blob_builder->FileSize();
-    compact->current_outputblobfile()->file_size = current_bytes;
-    delete compact->blob_builder;
-    compact->blob_builder = nullptr;
+      const uint64_t current_bytes = compact->blob_builder->FileSize();
 
-    s = compact->blob_file->Sync();
-    if (s.ok()) {
-      compact->blob_file->Close();
+      compact->current_outputblobfile()->file_size = current_bytes;
+
+      s = compact->blob_file->Sync();
+      if (s.ok()) {
+        compact->blob_file->Close();
+      }
     }
+
+    delete compact->blob_builder;
     delete compact->blob_file;
+    compact->blob_builder = nullptr;
     compact->blob_file = nullptr;
 
   } else {
-    assert(compact->blob_builder != nullptr);
-    assert(compact->blob_file != nullptr);
+    assert(compact->outfile != nullptr);
+    assert(compact->builder != nullptr);
 
     const uint64_t output_number = compact->current_output()->number;
     assert(output_number != 0);
@@ -1005,6 +1073,7 @@ Status DBImpl::FinishCompactionOutputFile(CompactionState* compact,
     } else {
       compact->builder->Abandon();
     }
+
     const uint64_t current_bytes = compact->builder->FileSize();
     compact->current_output()->file_size = current_bytes;
     compact->total_bytes += current_bytes;
@@ -1053,12 +1122,6 @@ Status DBImpl::InstallCompactionResults(CompactionState* compact) {
     const CompactionState::Output& out = compact->outputs[i];
     compact->compaction->edit()->AddFile(level + 1, out.number, out.file_size,
                                          out.smallest, out.largest);
-  }
-  // add new blob file
-
-  for (size_t i = 0; i < compact->outputs_blob_file.size(); ++i) {
-    const CompactionState::OutputBlobFile& blob = compact->outputs_blob_file[i];
-    compact->compaction->edit()->AddBlobFile(blob.number, blob.file_size);
   }
 
   return versions_->LogAndApply(compact->compaction->edit(), &mutex_);
@@ -1161,8 +1224,9 @@ Status DBImpl::DoCompactionWork(CompactionState* compact) {
         (int)last_sequence_for_key, (int)compact->smallest_snapshot);
 #endif
 
-    bool is_memtable_iter =
-        typeid(input->current()) == typeid(MemTableIterator) ? true : false;
+    uint64_t blob_number = input->GetBlobNumber();
+    uint64_t blob_file_size = input->GetBlobSize();
+
     if (!drop) {
       // Open output file if necessary
       if (compact->builder == nullptr) {
@@ -1174,26 +1238,12 @@ Status DBImpl::DoCompactionWork(CompactionState* compact) {
       if (compact->builder->NumEntries() == 0) {
         compact->current_output()->smallest.DecodeFrom(key);
       }
-
       compact->current_output()->largest.DecodeFrom(key);
 
-      std::string encode_key;
-      uint64_t blob_file_number = compact->current_outputblobfile()->number;
-      compact->builder->SetBlobNumber(blob_file_number);
-
-      std::string value;
-      PutFixed64(&value, compact->blob_builder->CurrentSizeEstimate());
-
-      compact->builder->Add(key, value);
-
-      if (is_memtable_iter) {
-        compact->blob_builder->Add(key, input->value());
-      } else {
-        std::string temp_value;
-        Status s = Get(ReadOptions(), key, &temp_value);
-        if (s.ok()) {
-          compact->blob_builder->Add(key, temp_value);
-        }
+      status = AddKVInSSTAndBlob(compact, key, input->value(), blob_number,
+                                 blob_file_size);
+      if (!status.ok()) {
+        return status;
       }
 
       // Close output file if it is big enough
@@ -1205,12 +1255,13 @@ Status DBImpl::DoCompactionWork(CompactionState* compact) {
         }
       }
     } else {
-      if (!is_memtable_iter) {
+      if (input->value().data()[0] == KVSeparation::kSeparation) {
         uint64_t discard_size = static_cast<uint64_t>(key.size()) +
                                 static_cast<uint64_t>(input->value().size());
-        uint64_t blob_number = input->GetBlobNumber();
         assert(blob_number > 0);
+        collector_->SetBlobFileSize(blob_number, blob_file_size);
         collector_->AddDiscardSize(blob_number, discard_size);
+        UpdateKVCache(key);
       }
     }
 
@@ -1250,8 +1301,74 @@ Status DBImpl::DoCompactionWork(CompactionState* compact) {
     RecordBackgroundError(status);
   }
   VersionSet::LevelSummaryStorage tmp;
+  VersionSet::BlobSummaryStorage blob_tmp;
   Log(options_.info_log, "compacted to: %s", versions_->LevelSummary(&tmp));
+  Log(options_.info_log, "generated to: %s",
+      versions_->GenerateBlobSummary(&blob_tmp));
   return status;
+}
+
+Status DBImpl::AddKVInSSTAndBlob(CompactionState* compact, const Slice& key,
+                                 const Slice& value, uint64_t blob_file_number,
+                                 uint64_t blob_file_size) {
+  Status s;
+
+  assert(value.size() >= 1);
+  if (value.data()[0] == KVSeparation::kNoSeparation) {
+    compact->builder->Add(key, value);
+  } else if (value.data()[0] == KVSeparation::kSeparation) {
+    assert(value.size() == 9);
+    std::string offset;
+    std::string encode_value;
+    encode_value.push_back(KVSeparation::kSeparation);
+    PutFixed64(&offset, compact->blob_builder->CurrentSizeEstimate());
+    encode_value += offset;
+    Slice blob_offset = Slice(value.data() + 1, value.size() - 1);
+
+    s = parsed_offset_->ParseValue(blob_file_number, blob_file_size,
+                                   blob_offset);
+    if (s.ok()) {
+      compact->builder->Add(key, encode_value);
+      compact->blob_builder->Add(key, parsed_offset_->GetValue());
+      UpdateKPCache(key, offset);
+    }
+  }
+  return s;
+}
+
+void DBImpl::UpdateKPCache(const Slice& key, const Slice& blob_offset) {
+  Cache::Handle* handle = adaptive_cache_->Lookup(key);
+  LRUHandle* lru_handle = nullptr;
+
+  if (handle != nullptr) {
+    lru_handle = reinterpret_cast<LRUHandle*>(handle);
+    if (lru_handle->handle_type == HandleType::kKPHandle) {
+      std::string* value =
+          new std::string(blob_offset.data(), blob_offset.size());
+
+      adaptive_cache_->Release(handle);
+      adaptive_cache_->Erase(key);
+
+      double caching_factor = 0.0;
+      handle = adaptive_cache_->Insert(
+          key, reinterpret_cast<std::string*>(value), 1, DeleteHandle,
+          HandleType::kKPHandle, caching_factor);
+
+      adaptive_cache_->Release(handle);
+    }
+  }
+}
+
+void DBImpl::UpdateKVCache(const Slice& key) {
+  Cache::Handle* handle = adaptive_cache_->Lookup(key);
+  LRUHandle* lru_handle = nullptr;
+
+  if (handle != nullptr) {
+    lru_handle = reinterpret_cast<LRUHandle*>(handle);
+    assert(lru_handle->handle_type == HandleType::kKVHandle);
+    adaptive_cache_->Release(handle);
+    adaptive_cache_->Erase(key);
+  }
 }
 
 namespace {
@@ -1697,10 +1814,12 @@ Status DB::Open(const Options& options, const std::string& dbname, DB** dbptr) {
   if (s.ok() && impl->mem_ == nullptr) {
     // Create new log and a corresponding memtable.
     uint64_t new_log_number = impl->versions_->NewFileNumber();
+    uint64_t max_blob_number = impl->versions_->BlobFileNumber();
     WritableFile* lfile;
     s = options.env->NewWritableFile(LogFileName(dbname, new_log_number),
                                      &lfile);
     if (s.ok()) {
+      edit.SetMaxBlobFileNumber(max_blob_number);
       edit.SetLogNumber(new_log_number);
       impl->logfile_ = lfile;
       impl->logfile_number_ = new_log_number;

@@ -20,6 +20,8 @@
 #include "util/coding.h"
 #include "util/logging.h"
 
+#include "ac-key/arc_cache.h"
+#include "ac-key/cache_format.h"
 #include "blob/basic_cache.h"
 
 namespace leveldb {
@@ -219,6 +221,10 @@ class Version::LevelFileNumIterator : public Iterator {
 
   Status status() const override { return Status::OK(); }
 
+  void SetIterType(bool is_mem_iter) override {}
+
+  bool IsMemIter() const override{};
+
  private:
   const InternalKeyComparator icmp_;
   const std::vector<FileMetaData*>* const flist_;
@@ -265,24 +271,6 @@ void Version::AddIterators(const ReadOptions& options,
   }
 }
 
-// Callback from TableCache::Get()
-namespace {
-enum SaverState {
-  kNotFound,
-  kFound,
-  kDeleted,
-  kCorrupt,
-};
-struct Saver {
-  SaverState state;
-  const Comparator* ucmp;
-  Slice user_key;
-  std::string* value;
-
-  Slice value_;
-};
-}  // namespace
-
 static void GetValueState(void* arg, const Slice& ikey, const Slice& v) {
   Saver* s = reinterpret_cast<Saver*>(arg);
   ParsedInternalKey parsed_key;
@@ -290,16 +278,14 @@ static void GetValueState(void* arg, const Slice& ikey, const Slice& v) {
     s->state = kCorrupt;
   } else {
     if (s->ucmp->Compare(parsed_key.user_key, s->user_key) == 0) {
+      if (v.data()[0] == KVSeparation::kNoSeparation) {
+        s->value->assign(v.data() + 1, v.size() - 1);
+      } else if (v.data()[0] == KVSeparation::kSeparation) {
+        s->blob_offset = Slice(v.data() + 1, v.size() - 1);
+      }
       s->state = (parsed_key.type == kTypeValue) ? kFound : kDeleted;
-      s->value_ = v;
     }
   }
-}
-
-static void SaveValue(void* arg, const Slice& decode_blob_offset,
-                      const Slice& v) {
-  Saver* s = reinterpret_cast<Saver*>(arg);
-  s->value->assign(v.data(), v.size());
 }
 
 static bool NewestFirst(FileMetaData* a, FileMetaData* b) {
@@ -370,15 +356,82 @@ Status Version::Get(const ReadOptions& options, const LookupKey& k,
     Status s;
     bool found;
 
-    Slice decode_blob_offset;
-
-    static Status SearchBlobFile(void* arg, uint64_t file_number,
-                                 uint64_t file_size) {
+    static Status SearchInBlobCache(void* arg, uint64_t file_number,
+                                    uint64_t file_size) {
       State* state = reinterpret_cast<State*>(arg);
-
       state->s = state->vset->blob_cache_->Get(
-          *state->options, file_number, file_size, state->decode_blob_offset,
+          *state->options, file_number, file_size, state->saver.blob_offset,
           &state->saver, SaveValue);
+      return state->s;
+    }
+
+    static void SearchInAdaptiveCache(State* state, const Slice& internal_key,
+                                      HitCacheType* hit_cache_type, int level) {
+      Cache* cache = state->vset->adaptive_cache_;
+      Cache::Handle* handle = cache->Lookup(internal_key);
+      LRUHandle* lru_handle = reinterpret_cast<LRUHandle*>(handle);
+
+      if (handle != nullptr) {
+        std::string* value =
+            reinterpret_cast<std::string*>(cache->Value(handle));
+
+        if (lru_handle->hit_cache_type == HitCacheType::kKVRealCache) {
+          state->saver.value->assign(value->data(), value->size());
+          cache->Release(handle);
+        } else if (lru_handle->hit_cache_type == HitCacheType::kKPRealCache) {
+          uint64_t blob_number = 0;
+          uint64_t blob_file_size = 0;
+
+          DecodeKPValue(value, &blob_number, &blob_file_size,
+                        &state->saver.blob_offset);
+
+          SearchInBlobCache(state, blob_number, blob_file_size);
+
+          std::string* value = new std::string(*state->saver.value);
+          double caching_factor = CalculateCachingFactor(
+              level, HandleType::kKVHandle, value->size());
+
+          cache->Release(handle);
+          handle = cache->Insert(internal_key, reinterpret_cast<void*>(value),
+                                 1, DeleteHandle, HandleType::kKVHandle,
+                                 caching_factor);
+          cache->Release(handle);
+        }
+
+        *hit_cache_type = lru_handle->hit_cache_type;
+      } else {
+        *hit_cache_type = HitCacheType::kNoHitCache;
+      }
+    }
+
+    static void InsertToCacheByHitType(State* state,
+                                       const HitCacheType& hit_cache_type,
+                                       int level) {
+      Cache* cache = state->vset->adaptive_cache_;
+      Cache::Handle* handle = nullptr;
+
+      if (hit_cache_type == HitCacheType::kKPGhostCache ||
+          hit_cache_type == HitCacheType::kKVGhostCache) {
+        std::string* value = new std::string(*state->saver.value);
+        double caching_factor =
+            CalculateCachingFactor(level, HandleType::kKVHandle, value->size());
+
+        handle = cache->Insert(state->ikey, value, 1, DeleteHandle,
+                               HandleType::kKVHandle, caching_factor);
+      } else {
+        std::string encode_value;
+        EncodeKPValue(&encode_value, state->saver.blob_number,
+                      state->saver.blob_size,
+                      DecodeFixed64(state->saver.blob_offset.data()));
+        std::string* value = new std::string(encode_value);
+        double caching_factor =
+            CalculateCachingFactor(level, HandleType::kKPHandle, value->size());
+
+        handle =
+            cache->Insert(state->ikey, reinterpret_cast<void*>(value), 1,
+                          DeleteHandle, HandleType::kKPHandle, caching_factor);
+      }
+      cache->Release(handle);
     }
 
     static bool Match(void* arg, int level, FileMetaData* f) {
@@ -391,22 +444,25 @@ Status Version::Get(const ReadOptions& options, const LookupKey& k,
         state->stats->seek_file_level = state->last_file_read_level;
       }
 
-      state->last_file_read = f;
-      state->last_file_read_level = level;
+      HitCacheType hit_cache_type = HitCacheType::kNoHitCache;
+      SearchInAdaptiveCache(state, state->ikey, &hit_cache_type,
+                            level);  //首先在KP以及KVCache中查找
 
-      state->s = state->vset->table_cache_->Get(*state->options, f->number,
-                                                f->file_size, state->ikey,
-                                                &state->saver, GetValueState);
-      if (state->saver.state == kFound) {
-        uint64_t blob_number = 0;
-        uint64_t blob_file_size = 0;
-        const char* ptr = state->saver.value_.data();
-        blob_number = DecodeFixed64(ptr);
-        state->decode_blob_offset =
-            Slice(ptr + sizeof(uint64_t), sizeof(uint64_t));
-        blob_file_size = DecodeFixed64(ptr + 2 * sizeof(uint64_t));
-        SearchBlobFile(reinterpret_cast<void*>(state), blob_number,
-                       blob_file_size);
+      //没有查到或者击中幽灵缓存 需要走sst->blob
+      if (hit_cache_type != HitCacheType::kKVRealCache &&
+          hit_cache_type != HitCacheType::kKPRealCache) {
+        state->last_file_read = f;
+        state->last_file_read_level = level;
+        state->s = state->vset->table_cache_->Get(*state->options, f->number,
+                                                  f->file_size, state->ikey,
+                                                  &state->saver, GetValueState);
+        if (state->saver.state == kFound) {
+          if (state->saver.blob_offset.compare(Slice()) != 0) {  //进行了KV分离
+            SearchInBlobCache(reinterpret_cast<void*>(state),
+                              state->saver.blob_number, state->saver.blob_size);
+            InsertToCacheByHitType(state, hit_cache_type, level);
+          }  //对于没有进行KV分离的k-v对不需要缓存在kpcache中,因为无论是否缓存都需要读取sst进行磁盘I/O
+        }
       }
 
       if (!state->s.ok()) {
@@ -448,6 +504,7 @@ Status Version::Get(const ReadOptions& options, const LookupKey& k,
   state.saver.ucmp = vset_->icmp_.user_comparator();
   state.saver.user_key = k.user_key();
   state.saver.value = value;
+  state.saver.blob_offset = Slice();
 
   ForEachOverlapping(state.saver.user_key, state.ikey, &state, &State::Match);
 
@@ -643,15 +700,10 @@ class VersionSet::Builder {
     std::set<uint64_t> deleted_files;
     FileSet* added_files;
   };
-  struct BlobState {
-    std::set<uint64_t> deleted_files;
-    std::vector<BlobFileMetaData*> added_files;
-  };
 
   VersionSet* vset_;
   Version* base_;
   LevelState levels_[config::kNumLevels];
-  BlobState blob_state_;
 
  public:
   // Initialize a builder with the files from *base and other info from *vset
@@ -726,15 +778,6 @@ class VersionSet::Builder {
       levels_[level].deleted_files.erase(f->number);
       levels_[level].added_files->insert(f);
     }
-
-    for (const auto& blob_number : edit->deleted_blob_files_) {
-      blob_state_.deleted_files.insert({blob_number});
-    }
-    for (const auto& blob_meta : edit->blob_files_) {
-      BlobFileMetaData* meta = new BlobFileMetaData(blob_meta);
-      meta->refs = 1;
-      blob_state_.added_files.emplace_back(meta);
-    }
   }
 
   // Save the current state in *v.
@@ -765,8 +808,6 @@ class VersionSet::Builder {
         MaybeAddFile(v, level, *base_iter);
       }
 
-      MaybeAddBlobFile(v);
-
 #ifndef NDEBUG
       // Make sure there is no overlap in levels > 0
       if (level > 0) {
@@ -782,17 +823,6 @@ class VersionSet::Builder {
         }
       }
 #endif
-    }
-  }
-
-  void MaybeAddBlobFile(Version* v) {
-    for (auto& blob_meta : blob_state_.added_files) {
-      if (blob_state_.deleted_files.count(blob_meta->number) > 0) {
-      } else {
-        std::vector<BlobFileMetaData*>& blob_files = v->blob_file_;
-        blob_meta->refs++;
-        blob_files.emplace_back(blob_meta);
-      }
     }
   }
 
@@ -813,20 +843,21 @@ class VersionSet::Builder {
 };
 
 VersionSet::VersionSet(const std::string& dbname, const Options* options,
-                       BasicCache* table_cache, BasicCache* blob_cache,
-                       const InternalKeyComparator* cmp)
+                       TableCache* table_cache, BlobCache* blob_cache,
+                       Cache* adaptive_cache, const InternalKeyComparator* cmp)
     : env_(options->env),
       dbname_(dbname),
       options_(options),
       table_cache_(table_cache),
       blob_cache_(blob_cache),
+      adaptive_cache_(adaptive_cache),
       icmp_(*cmp),
       next_file_number_(2),
       manifest_file_number_(0),  // Filled by Recover()
       last_sequence_(0),
       log_number_(0),
       prev_log_number_(0),
-      blob_number_(0),
+      blob_number_(kInValidBlobFileNumber),
       descriptor_file_(nullptr),
       descriptor_log_(nullptr),
       dummy_versions_(this),
@@ -978,10 +1009,12 @@ Status VersionSet::Recover(bool* save_manifest) {
   bool have_prev_log_number = false;
   bool have_next_file = false;
   bool have_last_sequence = false;
+  bool has_blob_number = false;
   uint64_t next_file = 0;
   uint64_t last_sequence = 0;
   uint64_t log_number = 0;
   uint64_t prev_log_number = 0;
+  uint64_t max_blob_number = 0;
   Builder builder(this, current_);
   int read_records = 0;
 
@@ -1028,6 +1061,11 @@ Status VersionSet::Recover(bool* save_manifest) {
         last_sequence = edit.last_sequence_;
         have_last_sequence = true;
       }
+
+      if (edit.has_blob_file_number_) {
+        max_blob_number = edit.max_blob_number_;
+        has_blob_number = true;
+      }
     }
   }
   delete file;
@@ -1061,6 +1099,7 @@ Status VersionSet::Recover(bool* save_manifest) {
     last_sequence_ = last_sequence;
     log_number_ = log_number;
     prev_log_number_ = prev_log_number;
+    blob_number_ = max_blob_number + 1;
 
     // See if we can reuse the existing MANIFEST file.
     if (ReuseManifest(dscname, current)) {
@@ -1198,6 +1237,17 @@ const char* VersionSet::LevelSummary(LevelSummaryStorage* scratch) const {
       int(current_->files_[4].size()), int(current_->files_[5].size()),
       int(current_->files_[6].size()));
   return scratch->buffer;
+}
+
+const char* VersionSet::GenerateBlobSummary(BlobSummaryStorage* scratch) const {
+  scratch->buffer += "blob files[ ";
+
+  for (const auto& blob_number : generate_blob_files_) {
+    scratch->buffer += std::to_string(blob_number);
+    scratch->buffer.push_back(' ');
+  }
+  scratch->buffer += "]";
+  return scratch->buffer.c_str();
 }
 
 uint64_t VersionSet::ApproximateOffsetOf(Version* v, const InternalKey& ikey) {

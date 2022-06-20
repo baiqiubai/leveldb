@@ -13,6 +13,7 @@
 #include "leveldb/iterator.h"
 #include "leveldb/table_builder.h"
 
+#include "ac-key/arc_cache.h"
 #include "blob/basic_cache.h"
 #include "blob/blob_builder.h"
 
@@ -22,21 +23,22 @@ Status FlushBuilderAndRecordState(BlobWapper* blob_wapper,
                                   SSTWapper* sst_wapper) {
   Status s;
   if (blob_wapper) {
-    s = blob_wapper->blob->Finish();
-    if (s.ok()) {
-      blob_wapper->meta->file_size = blob_wapper->blob->FileSize();
-      assert(blob_wapper->meta->file_size > 0);
+    if (blob_wapper->blob->FileSize() != kInValidBlobFileSize) {
+      s = blob_wapper->blob->Finish();
+      if (s.ok()) {
+        blob_wapper->meta->file_size = blob_wapper->blob->FileSize();
+        assert(blob_wapper->meta->file_size > 0);
+      }
+
+      if (s.ok()) {
+        s = blob_wapper->file->Sync();
+      }
+
+      if (s.ok()) {
+        s = blob_wapper->file->Close();
+      }
     }
     delete blob_wapper->blob;
-
-    if (s.ok()) {
-      s = blob_wapper->file->Sync();
-    }
-
-    if (s.ok()) {
-      s = blob_wapper->file->Close();
-    }
-
     delete blob_wapper->file;
     blob_wapper->file = nullptr;
 
@@ -64,9 +66,11 @@ Status FlushBuilderAndRecordState(BlobWapper* blob_wapper,
   return s;
 }
 
+void UpdateAdaptiveCache(const Slice& key, const Slice& value, Cache** cache) {}
+
 Status BuildTable(const std::string& dbname, Env* env, const Options& options,
-                  BasicCache* table_cache, Iterator* iter, FileMetaData* meta,
-                  BlobFileMetaData* blob_meta) {
+                  TableCache* table_cache, Iterator* iter, FileMetaData* meta,
+                  BlobFileMetaData* blob_meta, Cache** adaptive_cache) {
   Status s;
   meta->file_size = 0;
   blob_meta->file_size = 0;
@@ -94,13 +98,33 @@ Status BuildTable(const std::string& dbname, Env* env, const Options& options,
     meta->smallest.DecodeFrom(iter->key());
 
     Slice key;
+    Slice value;
 
     for (; iter->Valid(); iter->Next()) {
-      std::string value;
       key = iter->key();
-      PutFixed64(&value, blob_builder->CurrentSizeEstimate());
-      builder->Add(key, value);
-      blob_builder->Add(key, iter->value());
+      value = iter->value();
+      std::string encode_value;
+      std::string encode_offset;
+      bool is_separation = false;
+
+      uint64_t offset = blob_builder->CurrentSizeEstimate();
+
+      if (value.size() >= options.value_separation_threshold) {
+        PutFixed64(&encode_offset, offset);
+
+        encode_value.push_back(KVSeparation::kSeparation);
+        encode_value += encode_offset;
+        is_separation = true;
+        assert(encode_value.size() == 9);
+
+      } else {
+        encode_value.push_back(KVSeparation::kNoSeparation);
+        encode_value += value.ToString();
+      }
+      builder->Add(key, encode_value);
+      if (is_separation) {
+        blob_builder->Add(key, value);
+      }
     }
 
     if (!key.empty()) {
@@ -111,8 +135,10 @@ Status BuildTable(const std::string& dbname, Env* env, const Options& options,
 
     FlushBuilderAndRecordState(&blob_wapper, nullptr);
 
-    builder->SetBlobNumber(blob_meta->number);
-    builder->SetBlobSize(blob_meta->file_size);
+    if (blob_builder->FileSize() != kInValidBlobFileSize) {
+      builder->SetBlobNumber(blob_meta->number);
+      builder->SetBlobSize(blob_meta->file_size);
+    }
 
     SSTWapper sst_wapper(builder, sst_file, meta);
 
@@ -135,6 +161,13 @@ Status BuildTable(const std::string& dbname, Env* env, const Options& options,
 
   if (s.ok() && meta->file_size > 0 && blob_meta->file_size > 0) {
     // Keep it
+  } else if (s.ok()) {
+    if (meta->file_size == 0) {
+      env->RemoveFile(sst_fname);
+    }
+    if (blob_meta->file_size == 0) {
+      env->RemoveFile(blob_fname);
+    }
   } else {
     env->RemoveFile(sst_fname);
     env->RemoveFile(blob_fname);

@@ -34,7 +34,8 @@ class Compaction;
 class Iterator;
 class MemTable;
 class TableBuilder;
-class BasicCache;
+class TableCache;
+class BlobCache;
 class Version;
 class VersionSet;
 class WritableFile;
@@ -101,8 +102,9 @@ class Version {
 
   // Returns true iff some file in the specified level overlaps
   // some part of [*smallest_user_key,*largest_user_key].
-  // smallest_user_key==nullptr represents a key smaller than all the DB's keys.
-  // largest_user_key==nullptr represents a key largest than all the DB's keys.
+  // smallest_user_key==nullptr represents a key smaller than all the DB's
+  // keys. largest_user_key==nullptr represents a key largest than all the
+  // DB's keys.
   bool OverlapInLevel(int level, const Slice* smallest_user_key,
                       const Slice* largest_user_key);
 
@@ -155,8 +157,6 @@ class Version {
   // List of files per level
   std::vector<FileMetaData*> files_[config::kNumLevels];
 
-  std::vector<BlobFileMetaData*> blob_file_;
-
   // Next file to compact based on seek stats.
   FileMetaData* file_to_compact_;
   int file_to_compact_level_;
@@ -171,8 +171,8 @@ class Version {
 class VersionSet {
  public:
   VersionSet(const std::string& dbname, const Options* options,
-             BasicCache* table_cache, BasicCache* blob_cache,
-             const InternalKeyComparator*);
+             TableCache* table_cache, BlobCache* blob_cache,
+             Cache* adaptive_cache, const InternalKeyComparator*);
   VersionSet(const VersionSet&) = delete;
   VersionSet& operator=(const VersionSet&) = delete;
 
@@ -276,6 +276,18 @@ class VersionSet {
   };
   const char* LevelSummary(LevelSummaryStorage* scratch) const;
 
+  struct BlobSummaryStorage {
+    std::string buffer;
+  };
+
+  const char* GenerateBlobSummary(BlobSummaryStorage* scratch) const;
+
+  void AddGenerateBlobNumber(uint64_t blob_number) {
+    generate_blob_files_.emplace_back(blob_number);
+  }
+
+  void CleanGenerateBlobList() { generate_blob_files_.clear(); }
+
  private:
   class Builder;
 
@@ -303,8 +315,9 @@ class VersionSet {
   Env* const env_;
   const std::string dbname_;
   const Options* const options_;
-  BasicCache* const table_cache_;
-  BasicCache* const blob_cache_;
+  TableCache* const table_cache_;
+  BlobCache* const blob_cache_;
+  Cache* adaptive_cache_;
   const InternalKeyComparator icmp_;
   uint64_t next_file_number_;
   uint64_t manifest_file_number_;
@@ -322,6 +335,8 @@ class VersionSet {
   // Per-level key at which the next compaction at that level should start.
   // Either an empty string, or a valid InternalKey.
   std::string compact_pointer_[config::kNumLevels];
+
+  std::vector<uint64_t> generate_blob_files_;
 };
 
 // A Compaction encapsulates information about a compaction.

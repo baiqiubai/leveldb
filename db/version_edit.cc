@@ -20,9 +20,8 @@ enum Tag {
   kCompactPointer = 5,
   kDeletedFile = 6,
   kNewFile = 7,
-  kNewBlobFile = 8,
-  kDeletedBlobFile = 9,
-  kPrevLogNumber = 10
+  kPrevLogNumber = 8,
+  kBlobNumber = 9,
 };
 
 void VersionEdit::Clear() {
@@ -31,15 +30,15 @@ void VersionEdit::Clear() {
   prev_log_number_ = 0;
   last_sequence_ = 0;
   next_file_number_ = 0;
+  max_blob_number_ = 0;
   has_comparator_ = false;
   has_log_number_ = false;
   has_prev_log_number_ = false;
   has_next_file_number_ = false;
   has_last_sequence_ = false;
+  has_blob_file_number_ = false;
   deleted_files_.clear();
-  deleted_blob_files_.clear();
   new_files_.clear();
-  blob_files_.clear();
 }
 
 void VersionEdit::EncodeTo(std::string* dst) const {
@@ -64,6 +63,11 @@ void VersionEdit::EncodeTo(std::string* dst) const {
     PutVarint64(dst, last_sequence_);
   }
 
+  if (has_blob_file_number_) {
+    PutVarint32(dst, kBlobNumber);
+    PutVarint64(dst, max_blob_number_);
+  }
+
   for (size_t i = 0; i < compact_pointers_.size(); i++) {
     PutVarint32(dst, kCompactPointer);
     PutVarint32(dst, compact_pointers_[i].first);  // level
@@ -84,18 +88,6 @@ void VersionEdit::EncodeTo(std::string* dst) const {
     PutVarint64(dst, f.file_size);
     PutLengthPrefixedSlice(dst, f.smallest.Encode());
     PutLengthPrefixedSlice(dst, f.largest.Encode());
-  }
-
-  for (const auto& blob_number : deleted_blob_files_) {
-    PutVarint32(dst, kDeletedBlobFile);
-    PutVarint64(dst, blob_number);
-  }
-
-  for (size_t i = 0; i < blob_files_.size(); ++i) {
-    const BlobFileMetaData& f = blob_files_[i];
-    PutVarint32(dst, kNewBlobFile);
-    PutVarint64(dst, f.number);
-    PutVarint64(dst, f.file_size);
   }
 }
 
@@ -174,6 +166,13 @@ Status VersionEdit::DecodeFrom(const Slice& src) {
           msg = "last sequence number";
         }
         break;
+      case kBlobNumber:
+        if (GetVarint64(&input, &max_blob_number_)) {
+          has_blob_file_number_ = true;
+        } else {
+          msg = "max-blob file number";
+        }
+        break;
 
       case kCompactPointer:
         if (GetLevel(&input, &level) && GetInternalKey(&input, &key)) {
@@ -199,21 +198,6 @@ Status VersionEdit::DecodeFrom(const Slice& src) {
           new_files_.push_back(std::make_pair(level, f));
         } else {
           msg = "new-file entry";
-        }
-        break;
-      case kDeletedBlobFile:
-        if (GetVarint64(&input, &blob_meta.number)) {
-          deleted_blob_files_.insert({blob_meta.number});
-        } else {
-          msg = "deleted blob file";
-        }
-        break;
-      case kNewBlobFile:
-        if (GetVarint64(&input, &blob_meta.number) &&
-            GetVarint64(&input, &blob_meta.file_size)) {
-          blob_files_.emplace_back(blob_meta);
-        } else {
-          msg = "new-blob file entry";
         }
         break;
       default:
@@ -256,6 +240,10 @@ std::string VersionEdit::DebugString() const {
     r.append("\n  LastSeq: ");
     AppendNumberTo(&r, last_sequence_);
   }
+  if (has_blob_file_number_) {
+    r.append("\n MaxBlob: ");
+    AppendNumberTo(&r, max_blob_number_);
+  }
   for (size_t i = 0; i < compact_pointers_.size(); i++) {
     r.append("\n  CompactPointer: ");
     AppendNumberTo(&r, compact_pointers_[i].first);
@@ -280,16 +268,6 @@ std::string VersionEdit::DebugString() const {
     r.append(f.smallest.DebugString());
     r.append(" .. ");
     r.append(f.largest.DebugString());
-  }
-  for (const auto& blob_number : deleted_blob_files_) {
-    r.append("\n RemoveBlobFile: ");
-    AppendNumberTo(&r, blob_number);
-  }
-  for (const auto& blob_meta : blob_files_) {
-    r.append("\n AddBlobFile: ");
-    AppendNumberTo(&r, blob_meta.number);
-    r.append(" ");
-    AppendNumberTo(&r, blob_meta.file_size);
   }
   r.append("\n}\n");
   return r;

@@ -26,7 +26,10 @@ struct FileMetaData {
 };
 
 struct BlobFileMetaData {
-  BlobFileMetaData() : refs(0), file_size(0) {}
+  BlobFileMetaData()
+      : refs(0),
+        number(kInValidBlobFileNumber),
+        file_size(kInValidBlobFileSize) {}
 
   int refs;
   uint64_t number;
@@ -63,6 +66,10 @@ class VersionEdit {
   void SetCompactPointer(int level, const InternalKey& key) {
     compact_pointers_.push_back(std::make_pair(level, key));
   }
+  void SetMaxBlobFileNumber(uint64_t num) {
+    has_blob_file_number_ = true;
+    max_blob_number_ = num;
+  }
 
   // Add the specified file at the specified number.
   // REQUIRES: This version has not been saved (see VersionSet::SaveTo)
@@ -77,20 +84,9 @@ class VersionEdit {
     new_files_.push_back(std::make_pair(level, f));
   }
 
-  void AddBlobFile(uint64_t file_number, uint64_t file_size) {
-    BlobFileMetaData f;
-    f.number = file_number;
-    f.file_size = file_size;
-    blob_files_.emplace_back(f);
-  }
-
   // Delete the specified "file" from the specified "level".
   void RemoveFile(int level, uint64_t file) {
     deleted_files_.insert(std::make_pair(level, file));
-  }
-
-  void RemoveBlobFile(uint64_t file_number) {
-    deleted_blob_files_.insert({file_number});
   }
 
   void EncodeTo(std::string* dst) const;
@@ -108,18 +104,18 @@ class VersionEdit {
   uint64_t log_number_;
   uint64_t prev_log_number_;
   uint64_t next_file_number_;
+  uint64_t max_blob_number_;
   SequenceNumber last_sequence_;
   bool has_comparator_;
   bool has_log_number_;
   bool has_prev_log_number_;
   bool has_next_file_number_;
   bool has_last_sequence_;
+  bool has_blob_file_number_;
 
   std::vector<std::pair<int, InternalKey>> compact_pointers_;
   DeletedFileSet deleted_files_;
-  DeletedBlobFileSet deleted_blob_files_;
   std::vector<std::pair<int, FileMetaData>> new_files_;
-  std::vector<BlobFileMetaData> blob_files_;
 };
 
 }  // namespace leveldb

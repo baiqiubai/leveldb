@@ -21,6 +21,7 @@
 #include "port/thread_annotations.h"
 
 #include "blob/drop_entries_collector.h"
+#include "blob/prefetcher.h"
 
 namespace leveldb {
 
@@ -29,7 +30,8 @@ pid_t gettid();
 
 }  // namespace detail
 class MemTable;
-class BasicCache;
+class TableCache;
+class BlobCache;
 class Version;
 class VersionEdit;
 class VersionSet;
@@ -52,15 +54,15 @@ class DBImpl : public DB {
   Status Write(const WriteOptions& options, WriteBatch* updates) override;
   Status Get(const ReadOptions& options, const Slice& key,
              std::string* value) override;
-  Status ScanNumOfValue(const ReadOptions&, const Slice& start, uint32_t count,
+  Status ScanNumOfValue(const ReadOptions&, const Slice* start, uint32_t count,
                         std::vector<std::string>* result) override;
   Status ScanNumOfEntries(
-      const ReadOptions&, const Slice& start, uint32_t count,
+      const ReadOptions&, const Slice* start, uint32_t count,
       std::vector<std::pair<std::string, std::string>>* result) override;
 
-  Status ForwardScan(const ReadOptions&, const Slice& start, const Slice& end,
+  Status ForwardScan(const ReadOptions&, const Slice* start, const Slice* end,
                      std::vector<std::string>* result) override;
-  Status BackwardScan(const ReadOptions&, const Slice& start, const Slice& end,
+  Status BackwardScan(const ReadOptions&, const Slice* start, const Slice* end,
                       std::vector<std::string>* result) override;
   Iterator* NewIterator(const ReadOptions&) override;
   const Snapshot* GetSnapshot() override;
@@ -90,6 +92,8 @@ class DBImpl : public DB {
   // Samples are taken approximately once every config::kReadBytesPeriod
   // bytes.
   void RecordReadSample(Slice key);
+
+  BlobCache* GetBlobCache();
 
  private:
   friend class DB;
@@ -127,7 +131,7 @@ class DBImpl : public DB {
 
   Status NewDB();
 
-  Status Scan(const ReadOptions&, const Slice& start, const Slice& end,
+  Status Scan(const ReadOptions&, const Slice* start, const Slice* end,
               std::vector<std::string>* result, bool is_forward_scan = true);
 
   // Recover the descriptor from persistent storage.  May do a significant
@@ -175,7 +179,8 @@ class DBImpl : public DB {
   Status FinishCompaction(CompactionState* compact, Iterator* input);
   Status FinishCompactionOutputFile(CompactionState* compact,
                                     bool is_compact_blob_file = true,
-                                    Iterator* input = nullptr);
+                                    Iterator* input = nullptr,
+                                    bool* blob_is_empty = nullptr);
   Status InstallCompactionResults(CompactionState* compact)
       EXCLUSIVE_LOCKS_REQUIRED(mutex_);
 
@@ -183,8 +188,16 @@ class DBImpl : public DB {
     return internal_comparator_.user_comparator();
   }
 
-  Status StartGC(const std::unordered_set<uint64_t>& dircard_blob_list,
-                 VersionEdit* edit);
+  Status StartGC(
+      const std::unordered_map<uint64_t, uint64_t>& dircard_blob_list,
+      VersionEdit* edit);
+  Status InsertBlobToCache(
+      const std::unordered_map<uint64_t, uint64_t>& blob_list);
+  Status AddKVInSSTAndBlob(CompactionState* compact, const Slice& key,
+                           const Slice& value, uint64_t blob_file_number,
+                           uint64_t blob_file_size);
+  void UpdateKPCache(const Slice& key, const Slice& blob_offset);
+  void UpdateKVCache(const Slice& key);
 
   // Constant after construction
   Env* const env_;
@@ -196,8 +209,9 @@ class DBImpl : public DB {
   const std::string dbname_;
 
   // table_cache_ provides its own synchronization
-  BasicCache* const table_cache_;
-  BasicCache* const blob_cache_;
+  TableCache* const table_cache_;
+  BlobCache* const blob_cache_;
+  Cache* adaptive_cache_;
 
   // Lock over the persistent DB state.  Non-null iff successfully acquired.
   FileLock* db_lock_;
@@ -231,7 +245,12 @@ class DBImpl : public DB {
 
   VersionSet* const versions_ GUARDED_BY(mutex_);
 
-  std::unique_ptr<DropEntriesCollector> collector_;
+  std::unique_ptr<DropEntriesCollector> collector_ GUARDED_BY(mutex_);
+
+  std::unique_ptr<Prefetcher> prefetcher_ GUARDED_BY(mutex_);
+
+  std::unique_ptr<ParsedDBIterator> parsed_offset_;
+
   // Have we encountered a background error in paranoid mode?
   Status bg_error_ GUARDED_BY(mutex_);
 

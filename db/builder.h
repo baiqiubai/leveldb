@@ -16,13 +16,13 @@ struct Options;
 struct FileMetaData;
 struct BlobFileMetaData;
 
+class Cache;
 class Env;
 class Iterator;
 class TableCache;
 class VersionEdit;
 class BlobBuilder;
 class TableBuilder;
-class BasicCache;
 class WritableFile;
 // Build a Table file from the contents of *iter.  The generated file
 // will be named according to meta->number.  On success, the rest of
@@ -30,8 +30,8 @@ class WritableFile;
 // If no data is present in *iter, meta->file_size will be set to
 // zero, and no Table file will be produced.
 Status BuildTable(const std::string& dbname, Env* env, const Options& options,
-                  BasicCache* table_cache, Iterator* iter, FileMetaData* meta,
-                  BlobFileMetaData* blob_meta);
+                  TableCache* table_cache, Iterator* iter, FileMetaData* meta,
+                  BlobFileMetaData* blob_meta, Cache** adaptive_cache);
 
 struct BlobWapper {
   BlobWapper(BlobBuilder* blob, WritableFile* file, BlobFileMetaData* meta)
@@ -62,6 +62,7 @@ struct SSTWapper {
 
 Status FlushBuilderAndRecordState(BlobWapper* blob_wapper,
                                   SSTWapper* sst_wapper);
+void UpdateAdaptiveCache(const Slice& key, const Slice& value, Cache** cache);
 
 }  // namespace leveldb
 
