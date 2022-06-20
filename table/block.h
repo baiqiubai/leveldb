@@ -18,7 +18,8 @@ class Comparator;
 class Block {
  public:
   // Initialize the block with the specified contents.
-  explicit Block(const BlockContents& contents);
+  explicit Block(const BlockContents& contents, uint64_t blob_number = 0,
+                 uint64_t blob_size = 0);
 
   Block(const Block&) = delete;
   Block& operator=(const Block&) = delete;
@@ -27,6 +28,14 @@ class Block {
 
   size_t size() const { return size_; }
   Iterator* NewIterator(const Comparator* comparator);
+
+  void SetBlobNumber(uint64_t blob_number);
+
+  void SetBlobSize(uint64_t blob_size);
+
+  uint64_t GetBlobNumber() const;
+
+  uint64_t GetBlobSize() const;
 
  private:
   class Iter;
@@ -37,6 +46,9 @@ class Block {
   size_t size_;
   uint32_t restart_offset_;  // Offset in data_ of restart array
   bool owned_;               // Block owns data_[]
+
+  uint64_t blob_number_;
+  uint64_t blob_size_;
 };
 
 }  // namespace leveldb

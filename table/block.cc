@@ -24,10 +24,13 @@ inline uint32_t Block::NumRestarts() const {
   return DecodeFixed32(data_ + size_ - sizeof(uint32_t));
 }
 
-Block::Block(const BlockContents& contents)
+Block::Block(const BlockContents& contents, uint64_t blob_number,
+             uint64_t blob_size)
     : data_(contents.data.data()),
       size_(contents.data.size()),
-      owned_(contents.heap_allocated) {
+      owned_(contents.heap_allocated),
+      blob_number_(blob_number),
+      blob_size_(blob_size) {
   if (size_ < sizeof(uint32_t)) {
     size_ = 0;  // Error marker
   } else {
@@ -46,6 +49,14 @@ Block::~Block() {
     delete[] data_;
   }
 }
+
+uint64_t Block::GetBlobNumber() const { return blob_number_; }
+
+uint64_t Block::GetBlobSize() const { return blob_size_; }
+
+void Block::SetBlobNumber(uint64_t blob_number) { blob_number_ = blob_number; }
+
+void Block::SetBlobSize(uint64_t blob_size) { blob_size_ = blob_size; }
 
 // Helper routine: decode the next block entry starting at "p",
 // storing the number of shared key bytes, non_shared key bytes,
@@ -90,6 +101,9 @@ class Block::Iter : public Iterator {
   Slice value_;
   Status status_;
 
+  uint64_t blob_number_;
+  uint64_t blob_size_;
+
   inline int Compare(const Slice& a, const Slice& b) const {
     return comparator_->Compare(a, b);
   }
@@ -116,13 +130,15 @@ class Block::Iter : public Iterator {
 
  public:
   Iter(const Comparator* comparator, const char* data, uint32_t restarts,
-       uint32_t num_restarts)
+       uint32_t num_restarts, uint64_t blob_number = 0, uint64_t blob_size = 0)
       : comparator_(comparator),
         data_(data),
         restarts_(restarts),
         num_restarts_(num_restarts),
         current_(restarts_),
-        restart_index_(num_restarts_) {
+        restart_index_(num_restarts_),
+        blob_number_(blob_number),
+        blob_size_(blob_size) {
     assert(num_restarts_ > 0);
   }
 
@@ -240,6 +256,10 @@ class Block::Iter : public Iterator {
     }
   }
 
+  uint64_t GetBlobNumber() const { return blob_number_; }
+
+  uint64_t GetBlobSize() const { return blob_size_; }
+
  private:
   void CorruptionError() {
     current_ = restarts_;
@@ -287,7 +307,8 @@ Iterator* Block::NewIterator(const Comparator* comparator) {
   if (num_restarts == 0) {
     return NewEmptyIterator();
   } else {
-    return new Iter(comparator, data_, restart_offset_, num_restarts);
+    return new Iter(comparator, data_, restart_offset_, num_restarts,
+                    blob_number_, blob_size_);
   }
 }
 

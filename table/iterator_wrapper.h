@@ -74,9 +74,27 @@ class IteratorWrapper {
     Update();
   }
 
-  Iterator* current() { return iter_; }
+  Iterator* current() const { return iter_; }
 
-  uint64_t GetBlobNumber() const { return iter_->GetBlobNumber(); }
+  uint64_t GetBlobNumber() const {
+    assert(iter_);
+    return iter_->GetBlobNumber();
+  }
+
+  uint64_t GetBlobSize() const {
+    assert(iter_);
+    return iter_->GetBlobSize();
+  }
+
+  bool IsMemIter() const {
+    assert(iter_);
+    return iter_->IsMemIter();
+  }
+
+  void SetIterType(bool is_mem_iter) {
+    assert(iter_);
+    iter_->SetIterType(is_mem_iter);
+  }
 
  private:
   void Update() {

@@ -4,6 +4,9 @@
 
 #include "table/merger.h"
 
+#include "db/memtable.h"
+#include <functional>
+
 #include "leveldb/comparator.h"
 #include "leveldb/iterator.h"
 
@@ -19,10 +22,12 @@ class MergingIterator : public Iterator {
         children_(new IteratorWrapper[n]),
         n_(n),
         current_(nullptr),
-        direction_(kForward) {
+        direction_(kForward),
+        callback_(nullptr) {
     for (int i = 0; i < n; i++) {
       children_[i].Set(children[i]);
     }
+    SetIterType(false);
   }
 
   ~MergingIterator() override { delete[] children_; }
@@ -129,11 +134,39 @@ class MergingIterator : public Iterator {
     return status;
   }
 
-  Iterator* current() const override { return current_->current(); }
+  Iterator* current() const override {
+    assert(Valid());
+    return current_->current();
+  }
 
-  uint64_t GetBlobNumber() const override { return current()->GetBlobNumber(); }
+  uint64_t GetBlobNumber() const override {
+    assert(Valid());
+    return current_->GetBlobNumber();
+  }
 
-  uint64_t GetBlobSize() const override { return current()->GetBlobSize(); }
+  uint64_t GetBlobSize() const override {
+    assert(Valid());
+    return current_->GetBlobSize();
+  }
+
+  void SetIterType(bool is_mem_iter) override {
+    for (int i = 0; i < n_; ++i) {
+      bool is_mem_iter = false;
+      if (typeid(*children_[i].current()) == typeid(MemTableIterator)) {
+        is_mem_iter = true;
+      }
+      children_[i].SetIterType(is_mem_iter);
+    }
+  }
+
+  bool IsMemIter() const override {
+    assert(Valid());
+    return current_->IsMemIter();
+  }
+
+  void SetCallback(const std::function<void(bool)>& callback) {
+    callback_ = callback;
+  }
 
  private:
   // Which direction is the iterator moving?
@@ -150,6 +183,8 @@ class MergingIterator : public Iterator {
   int n_;
   IteratorWrapper* current_;
   Direction direction_;
+
+  std::function<void(bool)> callback_;
 };
 
 void MergingIterator::FindSmallest() {
@@ -165,6 +200,9 @@ void MergingIterator::FindSmallest() {
     }
   }
   current_ = smallest;
+  if (current_ && callback_) {
+    callback_(current_->IsMemIter());
+  }
 }
 
 void MergingIterator::FindLargest() {
@@ -180,6 +218,9 @@ void MergingIterator::FindLargest() {
     }
   }
   current_ = largest;
+  if (current_ && callback_) {
+    callback_(current_->IsMemIter());
+  }
 }
 }  // namespace
 

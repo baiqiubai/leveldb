@@ -4,6 +4,8 @@
 
 #include "leveldb/table.h"
 
+#include "db/dbformat.h"
+
 #include "leveldb/cache.h"
 #include "leveldb/comparator.h"
 #include "leveldb/env.h"
@@ -67,16 +69,20 @@ Status Table::Open(const Options& options, RandomAccessFile* file,
   Slice footer_input;
   Status s = file->Read(size - Footer::kEncodedLength, Footer::kEncodedLength,
                         &footer_input, footer_space);
-  if (!s.ok()) return s;
+  if (!s.ok()) {
+    return s;
+  }
 
   Footer footer;
   s = footer.DecodeFrom(&footer_input);
-  if (!s.ok()) return s;
+  if (!s.ok()) {
+    return s;
+  }
 
   std::pair<uint64_t, uint64_t> blob_state;
   s = ReadBlobState(size, file, &blob_state);
 
-  if (s.ok()) {
+  if (!s.ok()) {
     return s;
   }
 
@@ -91,7 +97,8 @@ Status Table::Open(const Options& options, RandomAccessFile* file,
   if (s.ok()) {
     // We've successfully read the footer and the index block: we're
     // ready to serve requests.
-    Block* index_block = new Block(index_block_contents);
+    Block* index_block =
+        new Block(index_block_contents, blob_state.first, blob_state.second);
     Rep* rep = new Table::Rep;
     rep->options = options;
     rep->file = file;
@@ -209,7 +216,8 @@ Iterator* Table::BlockReader(void* arg, const ReadOptions& options,
           block = new Block(contents);
           if (contents.cachable && options.fill_cache) {
             cache_handle = block_cache->Insert(key, block, block->size(),
-                                               &DeleteCachedBlock);
+                                               &DeleteCachedBlock,
+                                               HandleType::kBlockHandle, 0);
           }
         }
       }
@@ -223,6 +231,8 @@ Iterator* Table::BlockReader(void* arg, const ReadOptions& options,
 
   Iterator* iter;
   if (block != nullptr) {
+    block->SetBlobNumber(table->rep_->blob_number);
+    block->SetBlobSize(table->rep_->blob_size);
     iter = block->NewIterator(table->rep_->options.comparator);
     if (cache_handle == nullptr) {
       iter->RegisterCleanup(&DeleteBlock, block, nullptr);
@@ -257,7 +267,11 @@ Status Table::InternalGet(const ReadOptions& options, const Slice& k, void* arg,
     } else {
       Iterator* block_iter = BlockReader(this, options, iiter->value());
       block_iter->Seek(k);
+
       if (block_iter->Valid()) {
+        Saver* saver = reinterpret_cast<Saver*>(arg);
+        saver->blob_number = rep_->blob_number;
+        saver->blob_size = rep_->blob_size;
         (*handle_result)(arg, block_iter->key(), block_iter->value());
       }
       s = block_iter->status();
