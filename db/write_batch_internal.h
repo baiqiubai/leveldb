@@ -42,4 +42,4 @@ class WriteBatchInternal {
 
 }  // namespace leveldb
 
-#endif  // STORAGE_LEVELDB_DB_WRITE_BATCH_INTERNAL_H_
+#endif  // STORAGE_LEVELDB_DB_WRITE_BATCH_INTERNAL_H_// Copyright (c) 2011 The LevelDB Authors. All rights reserved.

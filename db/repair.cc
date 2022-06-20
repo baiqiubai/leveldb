@@ -210,7 +210,7 @@ class Repairer {
 
     Iterator* iter = mem->NewIterator();
     status = BuildTable(dbname_, env_, options_, table_cache_, iter, &meta,
-                        &blob_meta);
+                        &blob_meta, nullptr);
     delete iter;
     mem->Unref();
     mem = nullptr;
