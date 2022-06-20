@@ -19,9 +19,15 @@ class DropEntriesCollector {
   DropEntriesCollector(const DropEntriesCollector&) = delete;
   DropEntriesCollector& operator=(const DropEntriesCollector&) = delete;
 
-  std::unordered_set<uint64_t> GetDeleteBlobFileList();
+  std::unordered_map<uint64_t, uint64_t> GetDeleteBlobFileList();
 
   void AddDiscardSize(uint64_t blob_number, uint64_t size);
+
+  void SetBlobFileSize(uint64_t blob_number, uint64_t blob_size);
+
+  uint64_t GetBlobSize(uint64_t blob_number);
+
+  void Clear();
 
  private:
   static constexpr double kEPS = 1e-7;
