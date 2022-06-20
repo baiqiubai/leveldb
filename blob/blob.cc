@@ -13,15 +13,112 @@ struct Blob::Rep {
   Options options_;
   RandomAccessFile* file_;
   uint64_t cache_id_;
-  std::string* data_;
+  BlobBlock* blob_block_;
   BlockHandle data_handle_;
 };
 
 Blob::~Blob() { delete rep_; }
 
-static void DeleteValue(const Slice& k, void* v) {
-  std::string* value = reinterpret_cast<std::string*>(v);
-  delete value;
+class BlobBlock::Iter : public Iterator {
+ public:
+  Iter(const char* data, uint64_t end)
+      : data_(data), end_(end), current_(0), entry_size_(0) {}
+
+  Slice value() const override {
+    assert(Valid());
+    return value_;
+  }
+
+  Slice key() const override {
+    assert(Valid());
+    return key_;
+  }
+
+  bool Valid() const override { return current_ < end_; }
+  void SeekToFirst() override;
+  void SeekToLast() override;
+  void Seek(const Slice& target) override;
+  void Next() override;
+  void Prev() override;
+
+  Status status() const override { return status_; }
+
+ private:
+  const char* data_;
+
+  uint64_t end_;
+  uint64_t current_;
+  uint32_t entry_size_;
+  Status status_;
+  Slice key_;
+  Slice value_;
+  void DecodeEntry(uint64_t offset);
+  void SeekByOffset(uint64_t offset);
+};
+
+void BlobBlock::Iter::DecodeEntry(uint64_t offset) {
+  const char* decode_start = data_ + offset;
+  uint32_t entry_size_ = DecodeFixed32(decode_start);
+  uint32_t key_size = DecodeFixed32(decode_start + sizeof(uint32_t));
+  uint32_t value_size =
+      DecodeFixed32(decode_start + 2 * sizeof(uint32_t) + key_size);
+
+  key_ = Slice(decode_start + 2 * sizeof(uint32_t), key_size);
+  value_ = Slice(decode_start + 3 * sizeof(uint32_t) + key_size, value_size);
+}
+
+void BlobBlock::Iter::SeekToFirst() { DecodeEntry(0); }
+
+void BlobBlock::Iter::Next() {
+  current_ += entry_size_;
+  DecodeEntry(current_);
+}
+
+void BlobBlock::Iter::SeekToLast() {}
+
+void BlobBlock::Iter::Prev() {}
+
+void BlobBlock::Iter::Seek(const Slice& data) {
+  uint64_t offset = DecodeFixed64(data.data());
+  SeekByOffset(offset);
+}
+
+void BlobBlock::Iter::SeekByOffset(uint64_t offset) {
+  assert(offset < end_);
+  DecodeEntry(offset);
+  current_ = offset;
+}
+
+BlobBlock::BlobBlock(const BlockContents& contents)
+    : data_(contents.data.data()),
+      size_(contents.data.size()),
+      owner_(contents.heap_allocated) {}
+
+BlobBlock::~BlobBlock() {
+  if (owner_) {
+    delete[] data_;
+  }
+}
+
+size_t BlobBlock::size() const { return size_; }
+
+Iterator* BlobBlock::NewIterator(const ReadOptions& options) const {
+  return new Iter(data_, size_);
+}
+
+static void DeleteBlock(void* arg, void* ignored) {
+  delete reinterpret_cast<BlobBlock*>(arg);
+}
+
+static void DeleteCachedBlock(const Slice& key, void* value) {
+  BlobBlock* block = reinterpret_cast<BlobBlock*>(value);
+  delete block;
+}
+
+static void ReleaseBlock(void* arg, void* h) {
+  Cache* cache = reinterpret_cast<Cache*>(arg);
+  Cache::Handle* handle = reinterpret_cast<Cache::Handle*>(h);
+  cache->Release(handle);
 }
 
 Status Blob::Open(const Options& options, RandomAccessFile* file,
@@ -36,16 +133,21 @@ Status Blob::Open(const Options& options, RandomAccessFile* file,
   Status s =
       file->Read(file_size - BlobFooter::kEncodedLength,
                  BlobFooter::kEncodedLength, &footer_input, footer_space);
-  if (!s.ok()) return s;
+  if (!s.ok()) {
+    return s;
+  }
 
   BlobFooter footer;
   s = footer.DecodeFrom(&footer_input);
-  if (!s.ok()) return s;
+  if (!s.ok()) {
+    return s;
+  }
 
   if (s.ok()) {
     Rep* rep = new Blob::Rep;
     rep->file_ = file;
     rep->options_ = options;
+    rep->blob_block_ = nullptr;
     rep->cache_id_ =
         rep->options_.block_cache ? rep->options_.block_cache->NewId() : 0;
     rep->data_handle_ = footer.data_handle();
@@ -54,31 +156,25 @@ Status Blob::Open(const Options& options, RandomAccessFile* file,
   return s;
 }
 
-Slice Blob::DecodeEntry(uint64_t offset) {
-  const char* decode_start = rep_->data_->data() + offset;
-  uint32_t entry_size = DecodeFixed32(decode_start);
-  uint32_t key_size = DecodeFixed32(decode_start + sizeof(uint32_t));
-  uint32_t value_size =
-      DecodeFixed32(decode_start + sizeof(uint32_t) + key_size);
-  return Slice(decode_start + offset + 2 * sizeof(uint32_t), value_size);
-}
-
 Status Blob::InternalGet(const ReadOptions& options, const Slice& k, void* arg,
                          void (*handle_result)(void* arg, const Slice& k,
                                                const Slice&)) {
-  Status s = BlockReader(this, options, rep_->data_handle_.offset());
-  if (s.ok()) {
-    uint64_t offset = DecodeFixed64(k.data());
-    Slice value = DecodeEntry(offset);
-    (*handle_result)(arg, k, value);
+  Iterator* iter = BlockReader(this, options, rep_->data_handle_.offset());
+  iter->Seek(k);
+  if (iter->Valid()) {
+    (*handle_result)(arg, k, iter->value());
+  } else {
+    return iter->status();
   }
+  delete iter;
+  return Status::OK();
 }
 
-Status Blob::BlockReader(void* arg, const ReadOptions& options,
-                         uint64_t handle_offset) {
+Iterator* Blob::BlockReader(void* arg, const ReadOptions& options,
+                            uint64_t handle_offset) {
   Blob* blob = reinterpret_cast<Blob*>(arg);
   Cache* block_cache = blob->rep_->options_.block_cache;
-  Block* block = nullptr;
+  BlobBlock* block = nullptr;
   Cache::Handle* cache_handle = nullptr;
 
   Status s;
@@ -91,20 +187,43 @@ Status Blob::BlockReader(void* arg, const ReadOptions& options,
     Slice key(cache_key_buffer, sizeof(cache_key_buffer));
     cache_handle = block_cache->Lookup(key);
     if (cache_handle != nullptr) {
-      blob->rep_->data_ =
-          reinterpret_cast<std::string*>(block_cache->Value(cache_handle));
+      block = reinterpret_cast<BlobBlock*>(block_cache->Value(cache_handle));
     } else {
       s = ReadBlock(blob->rep_->file_, options, rep_->data_handle_, &contents);
       if (s.ok()) {
-        blob->rep_->data_ = new std::string(contents.data.ToString());
+        block = new BlobBlock(contents);
         if (contents.cachable && options.fill_cache) {
-          cache_handle = block_cache->Insert(
-              key, rep_->data_, blob->rep_->data_->size(), &DeleteValue);
+          cache_handle =
+              block_cache->Insert(key, block, block->size(), &DeleteCachedBlock,
+                                  HandleType::kBlockHandle, 0);
         }
       }
     }
+  } else {
+    s = ReadBlock(blob->rep_->file_, options, rep_->data_handle_, &contents);
+    if (s.ok()) {
+      block = new BlobBlock(contents);
+    }
   }
-  return s;
+
+  Iterator* iter;
+  if (block != nullptr) {
+    iter = block->NewIterator(options);
+    if (cache_handle == nullptr) {
+      iter->RegisterCleanup(&DeleteBlock, block, nullptr);
+    } else {
+      iter->RegisterCleanup(&ReleaseBlock, block_cache, cache_handle);
+    }
+  } else {
+    return NewErrorIterator(s);
+  }
+
+  return iter;
+}
+
+Iterator* Blob::NewIterator(const ReadOptions& options) {
+  return new BlobBlock::Iter(
+      nullptr, 0);  //这里不需要使用Blob iter仅仅需要析构的时候调用回调函数即可
 }
 
 }  // namespace leveldb
