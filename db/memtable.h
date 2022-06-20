@@ -108,8 +108,8 @@ class MemTableIterator : public Iterator {
   Iterator* current() const override;
 
   uint64_t GetBlobNumber() const override;
-
   uint64_t GetBlobSize() const override;
+  bool IsMemIter() const override;
 
  private:
   MemTable::Table::Iterator iter_;

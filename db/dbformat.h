@@ -14,6 +14,7 @@
 #include "leveldb/filter_policy.h"
 #include "leveldb/slice.h"
 #include "leveldb/table_builder.h"
+
 #include "util/coding.h"
 #include "util/logging.h"
 
@@ -65,6 +66,34 @@ typedef uint64_t SequenceNumber;
 // We leave eight bits empty at the bottom so a type and sequence#
 // can be packed together into 64-bits.
 static const SequenceNumber kMaxSequenceNumber = ((0x1ull << 56) - 1);
+
+static const uint64_t kInValidBlobFileSize = 0;
+
+static const uint64_t kInValidBlobFileNumber = 0;
+
+enum KVSeparation : char {
+  kNoSeparation = 0x0,
+  kSeparation = 0x1,
+};
+
+enum SaverState {
+  kNotFound,
+  kFound,
+  kDeleted,
+  kCorrupt,
+};
+struct Saver {
+  SaverState state;
+  const Comparator* ucmp;
+  Slice user_key;
+  std::string* value;
+
+  uint64_t blob_number;
+  uint64_t blob_size;
+  Slice blob_offset;
+};
+
+void SaveValue(void* arg, const Slice& key, const Slice& value);
 
 struct ParsedInternalKey {
   Slice user_key;

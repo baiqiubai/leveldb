@@ -133,4 +133,9 @@ LookupKey::LookupKey(const Slice& user_key, SequenceNumber s) {
   end_ = dst;
 }
 
+void SaveValue(void* arg, const Slice& key, const Slice& value) {
+  Saver* saver = reinterpret_cast<Saver*>(arg);
+  saver->value->assign(value.data(), value.size());
+}
+
 }  // namespace leveldb

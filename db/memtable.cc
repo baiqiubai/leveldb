@@ -73,9 +73,13 @@ Status MemTableIterator::status() const { return Status::OK(); }
 
 Iterator* MemTableIterator::current() const { return nullptr; }
 
-uint64_t MemTableIterator::GetBlobNumber() const { return 0; }
+uint64_t MemTableIterator::GetBlobNumber() const {
+  return kInValidBlobFileNumber;
+}
 
-uint64_t MemTableIterator::GetBlobSize() const { return 0; }
+uint64_t MemTableIterator::GetBlobSize() const { return kInValidBlobFileSize; }
+
+bool MemTableIterator::IsMemIter() const { return true; }
 
 Iterator* MemTable::NewIterator() { return new MemTableIterator(&table_); }
 

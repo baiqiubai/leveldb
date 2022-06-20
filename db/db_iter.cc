@@ -7,11 +7,15 @@
 #include "db/db_impl.h"
 #include "db/dbformat.h"
 #include "db/filename.h"
+#include "db/memtable.h"
+#include <functional>
+#include <typeinfo>
 
 #include "leveldb/env.h"
 #include "leveldb/iterator.h"
 
 #include "port/port.h"
+#include "table/two_level_iterator.h"
 #include "util/logging.h"
 #include "util/mutexlock.h"
 #include "util/random.h"
@@ -56,7 +60,18 @@ class DBIter : public Iterator {
         direction_(kForward),
         valid_(false),
         rnd_(seed),
-        bytes_until_read_sampling_(RandomCompactionPeriod()) {}
+        bytes_until_read_sampling_(RandomCompactionPeriod()),
+        blob_number_(0),
+        blob_size_(0) {
+    if (typeid(*iter_) == typeid(MemTableIterator)) {
+      is_mem_iter_ = true;
+    } else if (typeid(*iter_) == typeid(TwoLevelIterator)) {
+      is_mem_iter_ = false;
+    } else {
+      iter_->SetCallback(
+          std::bind(&DBIter::SetIterType, this, std::placeholders::_1));
+    }
+  }
 
   DBIter(const DBIter&) = delete;
   DBIter& operator=(const DBIter&) = delete;
@@ -84,7 +99,17 @@ class DBIter : public Iterator {
   void Seek(const Slice& target) override;
   void SeekToFirst() override;
   void SeekToLast() override;
+
   Iterator* current() const override;
+  uint64_t GetBlobNumber() const override;
+  uint64_t GetBlobSize() const override;
+
+  void SetIterType(bool is_mem_iter) override { is_mem_iter_ = is_mem_iter; }
+
+  bool IsMemIter() const override {
+    assert(valid_);
+    return is_mem_iter_;
+  }
 
  private:
   void FindNextUserEntry(bool skipping, std::string* skip);
@@ -93,6 +118,16 @@ class DBIter : public Iterator {
 
   inline void SaveKey(const Slice& k, std::string* dst) {
     dst->assign(k.data(), k.size());
+  }
+
+  void SaveBlobStatus() {
+    if (!is_mem_iter_) {
+      blob_number_ = current()->GetBlobNumber();
+      blob_size_ = current()->GetBlobSize();
+    } else {
+      blob_number_ = kInValidBlobFileNumber;
+      blob_size_ = kInValidBlobFileSize;
+    }
   }
 
   inline void ClearSavedValue() {
@@ -120,6 +155,10 @@ class DBIter : public Iterator {
   bool valid_;
   Random rnd_;
   size_t bytes_until_read_sampling_;
+
+  uint64_t blob_number_;
+  uint64_t blob_size_;
+  bool is_mem_iter_;
 };
 
 inline bool DBIter::ParseKey(ParsedInternalKey* ikey) {
@@ -189,6 +228,7 @@ void DBIter::FindNextUserEntry(bool skipping, std::string* skip) {
           // Arrange to skip all upcoming entries for this key since
           // they are hidden by this deletion.
           SaveKey(ikey.user_key, skip);
+          SaveBlobStatus();
           skipping = true;
           break;
         case kTypeValue:
@@ -196,6 +236,7 @@ void DBIter::FindNextUserEntry(bool skipping, std::string* skip) {
               user_comparator_->Compare(ikey.user_key, *skip) <= 0) {
             // Entry hidden
           } else {
+            SaveBlobStatus();
             valid_ = true;
             saved_key_.clear();
             return;
@@ -261,10 +302,15 @@ void DBIter::FindPrevUserEntry() {
           }
           SaveKey(ExtractUserKey(iter_->key()), &saved_key_);
           saved_value_.assign(raw_value.data(), raw_value.size());
+          SaveBlobStatus();
         }
       }
       iter_->Prev();
     } while (iter_->Valid());
+  }
+
+  if (iter_->Valid()) {
+    SaveBlobStatus();
   }
 
   if (value_type == kTypeDeletion) {
@@ -310,7 +356,17 @@ void DBIter::SeekToLast() {
   FindPrevUserEntry();
 }
 
-Iterator* DBIter::current() const { return iter_; }
+Iterator* DBIter::current() const {
+  assert(iter_->Valid());
+  if (is_mem_iter_) {
+    return iter_;
+  }
+  return iter_->current();
+}
+
+uint64_t DBIter::GetBlobNumber() const { return blob_number_; }
+
+uint64_t DBIter::GetBlobSize() const { return blob_size_; }
 
 }  // anonymous namespace
 
