@@ -14,7 +14,7 @@
 
 namespace leveldb {
 
-Prefetcher::Prefetcher(DB* db, BasicCache* blob_cache)
+Prefetcher::Prefetcher(DB* db, BlobCache* blob_cache)
     : db_(db),
       blob_cache_(blob_cache),
       iter_(nullptr),
@@ -24,42 +24,38 @@ Prefetcher::Prefetcher(DB* db, BasicCache* blob_cache)
 
 Prefetcher::~Prefetcher() {
   thread_pool_->Stop();
-  delete iter_;  //必须手动delete
+  delete iter_;
 }
 
-void Prefetcher::LazyNewIterator(const ReadOptions& options) {
-  if (iter_ == nullptr) {
-    iter_ = db_->NewIterator(options);
-  }
-}
-
-Status Prefetcher::FetchValue(const ReadOptions& options, const Slice& start,
+Status Prefetcher::FetchValue(const ReadOptions& options, const Slice* start,
                               uint32_t count,
                               std::vector<std::string>* result) {
   return HelpForFetch(options, start, count, result);
 }
 
 Status Prefetcher::FetchEntries(
-    const ReadOptions& options, const Slice& start, uint32_t count,
+    const ReadOptions& options, const Slice* start, uint32_t count,
     std::vector<std::pair<std::string, std::string>>* result) {
   return HelpForFetch(options, start, count, nullptr, true, result);
 }
 
 void Prefetcher::SaveValue(void* arg, const Slice& k, const Slice& v) {
-  Saver* saver = reinterpret_cast<Saver*>(arg);
-  saver->value_->assign(v.data(), v.size());
+  std::string* result = reinterpret_cast<std::string*>(arg);
+  result->assign(v.data(), v.size());
 }
 
-Status Prefetcher::PackingFunction(void* arg, const ReadOptions& options,
+Status Prefetcher::FindAndSetValue(void* arg, const ReadOptions& options,
                                    uint64_t blob_number, uint64_t blob_size,
-                                   const Slice& decode_blob_offset,
+                                   const Slice& blob_offset,
                                    std::promise<std::string>* pro) {
-  BasicCache* blob_cache = reinterpret_cast<BasicCache*>(arg);
+  assert(blob_offset.data()[0] == KVSeparation::kSeparation);
+  assert(blob_offset.size() == 9);
+
+  BlobCache* blob_cache = reinterpret_cast<BlobCache*>(arg);
   std::string value;
-  Saver saver;
-  saver.value_ = &value;
-  Status s = blob_cache->Get(options, blob_number, blob_size,
-                             decode_blob_offset, &saver, &SaveValue);
+
+  Status s = blob_cache->Get(options, blob_number, blob_size, value, &value,
+                             &SaveValue);
   if (s.ok()) {
     pro->set_value(value);
   }
@@ -67,48 +63,37 @@ Status Prefetcher::PackingFunction(void* arg, const ReadOptions& options,
 }
 
 Status Prefetcher::HelpForFetch(
-    const ReadOptions& options, const Slice& start, uint32_t count,
+    const ReadOptions& options, const Slice* start, uint32_t count,
     std::vector<std::string>* values, bool get_kv,
     std::vector<std::pair<std::string, std::string>>* result) {
-  LazyNewIterator(options);
+  InitIter(options, start, true);
+
+  if (!iter_->Valid()) {
+    return iter_->status();
+  }
 
   int32_t i = 0;
-  std::vector<std::string> temp_values;
-  std::vector<std::string> temp_keys;
-  if (get_kv) {
-    temp_keys.reserve(count);
-    temp_values.resize(count);
-    values = &temp_values;
-  } else {
-    values->reserve(count);
-  }
-  thread_pool_->SetTaskNum(count);
+  uint32_t num_of_entries = count;
+  std::vector<std::pair<std::string, std::string>> temp;
+  temp.resize(num_of_entries);
 
-  if (start.compare(Slice()) == 0) {
-    iter_->SeekToFirst();
-  } else {
-    iter_->Seek(start);
-  }
+  while (iter_->Valid() && count--) {
+    temp[i].first = iter_->key().ToString();
 
-  ReadOptions opts;
-  Saver saver;
-
-  for (; iter_->Valid() && count--; iter_->Next()) {
-    bool is_memtable_iterator =
-        (typeid(*iter_->current()) == typeid(MemTableIterator)) ? true : false;
-    if (is_memtable_iterator) {
-      (*values)[i] = std::move(iter_->value().ToString());
+    Slice value = iter_->value();
+    if (NeedFindInBlobCache(iter_->IsMemIter(), value)) {
+      thread_pool_->AddTask(std::bind(
+          &BlobCache::Get, blob_cache_, options, iter_->GetBlobNumber(),
+          iter_->GetBlobSize(), iter_->value(), &temp[i].second, &SaveValue));
     } else {
-      uint64_t blob_number = iter_->GetBlobNumber();
-      uint64_t blob_size = iter_->GetBlobSize();
-      saver.value_ = &(*values)[i];
-      thread_pool_->AddTask(std::bind(&BasicCache::Get, blob_cache_, opts,
-                                      blob_number, blob_size, iter_->value(),
-                                      &saver, &SaveValue));
+      if (iter_->IsMemIter()) {
+        temp[i].second = value.ToString();
+      } else {
+        assert(value.data()[0] == kNoSeparation);
+        temp[i].second = Slice(value.data() + 1, value.size() - 1).ToString();
+      }
     }
-    if (get_kv) {
-      temp_keys.emplace_back(std::move(iter_->key().ToString()));
-    }
+    MoveIter(true);
     ++i;
   }
 
@@ -116,63 +101,88 @@ Status Prefetcher::HelpForFetch(
     ;
   }
 
-  if (get_kv) {
-    assert(temp_keys.size() == temp_values.size());
-    for (int i = 0; i < count; ++i) {
-      result->push_back({temp_keys[i], temp_values[i]});
+  if (!get_kv) {
+    values->resize(num_of_entries);
+    for (uint32_t i = 0; i < num_of_entries; ++i) {
+      (*values)[i] = std::move(temp[i].second);
     }
+  } else {
+    *result = std::vector<std::pair<std::string, std::string>>(temp.begin(),
+                                                               temp.end());
   }
 
   return Status::OK();
 }
 
-Status Prefetcher::FetchInterval(const ReadOptions& options, const Slice& start,
-                                 const Slice& end,
-                                 std::vector<std::string>* result,
-                                 bool is_forward_scan) {
-  LazyNewIterator(options);
+void Prefetcher::InitIter(const ReadOptions& options, const Slice* start,
+                          bool is_forward_scan) {
+  delete iter_;
+  iter_ = db_->NewIterator(options);
 
-  if (start.compare(Slice()) == 0) {
+  if (start == nullptr) {
     if (is_forward_scan) {
       iter_->SeekToFirst();
     } else {
       iter_->SeekToLast();
     }
   } else {
-    iter_->Seek(start);
+    iter_->Seek(*start);
+  }
+}
+
+void Prefetcher::MoveIter(bool is_forward_scan) {
+  if (is_forward_scan) {
+    iter_->Next();
+  } else {
+    iter_->Prev();
+  }
+}
+
+bool Prefetcher::NeedFindInBlobCache(bool is_mem_iter, const Slice& value) {
+  return !is_mem_iter && value.data()[0] == kSeparation;
+}
+
+Status Prefetcher::FetchInterval(const ReadOptions& options, const Slice* start,
+                                 const Slice* end,
+                                 std::vector<std::string>* result,
+                                 bool is_forward_scan) {
+  InitIter(options, start, is_forward_scan);
+
+  if (!iter_->Valid()) {
+    return iter_->status();
   }
 
   std::vector<std::future<std::string>> futures;
   std::vector<std::shared_ptr<std::promise<std::string>>> protect_promises;
-  ReadOptions opts;
   //此处利用shared_ptr保护promise不被析构
 
   while (iter_->Valid()) {
-    bool is_memtable_iterator =
-        (typeid(*iter_->current()) == typeid(MemTableIterator)) ? true : false;
+    std::shared_ptr<std::promise<std::string>> pro(
+        std::make_shared<std::promise<std::string>>());
+    std::future<std::string> fu = pro->get_future();
+    Slice value = iter_->value();
+    protect_promises.emplace_back(pro);
 
-    if (is_memtable_iterator) {
-      result->emplace_back(iter_->value().ToString());
+    if (NeedFindInBlobCache(iter_->IsMemIter(), value)) {
+      thread_pool_->AddTask(std::bind(&Prefetcher::FindAndSetValue,
+                                      reinterpret_cast<void*>(blob_cache_),
+                                      options, iter_->GetBlobNumber(),
+                                      iter_->GetBlobSize(), value, pro.get()));
     } else {
-      std::shared_ptr<std::promise<std::string>> pro(
-          std::make_shared<std::promise<std::string>>());
-      protect_promises.emplace_back(pro);
-      std::future<std::string> fu = pro->get_future();
-      uint64_t blob_number = iter_->GetBlobNumber();
-      uint64_t blob_size = iter_->GetBlobSize();
-      thread_pool_->AddTask(std::bind(
-          &Prefetcher::PackingFunction, reinterpret_cast<void*>(blob_cache_),
-          opts, blob_number, blob_size, iter_->value(), pro.get()));
-      futures.emplace_back(std::move(fu));
+      if (iter_->IsMemIter()) {
+        pro->set_value(value.ToString());
+      } else {
+        assert(value.data()[0] == kNoSeparation);
+        pro->set_value(Slice(value.data() + 1, value.size() - 1).ToString());
+      }
+    }
+    futures.emplace_back(std::move(fu));
+
+    if (end != nullptr && iter_->key().compare(*end) == 0) {
+      break;
     }
 
-    if (iter_->key().compare(end) == 0) break;
-
-    if (is_forward_scan) {
-      iter_->Next();
-    } else {
-      iter_->Prev();
-    }
+    MoveIter(is_forward_scan);
   }
 
   while (!thread_pool_->AllTaskIsFinished()) {
@@ -186,16 +196,18 @@ Status Prefetcher::FetchInterval(const ReadOptions& options, const Slice& start,
   return Status::OK();
 }
 
-ParseIteratorValue::ParseIteratorValue() {}
+ParsedDBIterator::ParsedDBIterator(BlobCache* cache) : blob_cache_(cache) {}
 
-ParseIteratorValue::~ParseIteratorValue() { Clear(); }
-
-void ParseIteratorValue::Clear() { to_value_.clear(); }
-
-Status ParseIteratorValue::Parse(const Slice& from_value) {
-  uint64_t offset = DecodeFixed64(from_value.data());
+Status ParsedDBIterator::ParseValue(uint64_t blob_number, uint64_t blob_size,
+                                    const Slice& decode_offset) {
+  Saver saver;
+  saver.value = &save_to_value_;
+  return blob_cache_->Get(ReadOptions(), blob_number, blob_size, decode_offset,
+                          &saver, SaveValue);
 }
 
-std::string ParseIteratorValue::GetValue() const { return to_value_; }
+std::string ParsedDBIterator::GetValue() const { return save_to_value_; }
+
+ParsedDBIterator::~ParsedDBIterator() { save_to_value_.clear(); }
 
 }  // namespace leveldb

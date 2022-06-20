@@ -15,62 +15,64 @@ class Slice;
 class ThreadPool;
 class DB;
 class Iterator;
-class BasicCache;
+class BlobCache;
 
 class Prefetcher {
  public:
-  explicit Prefetcher(DB* db, BasicCache* blob_cache);
+  explicit Prefetcher(DB* db, BlobCache* blob_cache);
 
   ~Prefetcher();
 
-  Status FetchInterval(const ReadOptions&, const Slice& start, const Slice& end,
+  Status FetchInterval(const ReadOptions&, const Slice* start, const Slice* end,
                        std::vector<std::string>* result, bool is_forward_scan);
 
-  Status FetchValue(const ReadOptions&, const Slice& start, uint32_t count,
+  Status FetchValue(const ReadOptions&, const Slice* start, uint32_t count,
                     std::vector<std::string>* result);
 
-  Status FetchEntries(const ReadOptions&, const Slice& start, uint32_t count,
+  Status FetchEntries(const ReadOptions&, const Slice* start, uint32_t count,
                       std::vector<std::pair<std::string, std::string>>* result);
 
  private:
-  void LazyNewIterator(const ReadOptions& options);
+  void InitIter(const ReadOptions& options, const Slice* start,
+                bool is_forward_scan);
 
-  struct Saver {
-    std::string* value_;
-  };
+  void MoveIter(bool is_forward_scan);
 
   static void SaveValue(void* arg, const Slice& k, const Slice& v);
 
-  static Status PackingFunction(void* arg, const ReadOptions& options,
+  static Status FindAndSetValue(void* arg, const ReadOptions& options,
                                 uint64_t blob_number, uint64_t blob_size,
-                                const Slice& decode_blob_offset,
+                                const Slice& blob_offset,
                                 std::promise<std::string>* pro);
 
   Status HelpForFetch(
-      const ReadOptions&, const Slice& start, uint32_t count,
+      const ReadOptions&, const Slice* start, uint32_t count,
       std::vector<std::string>* values, bool get_kv = false,
       std::vector<std::pair<std::string, std::string>>* result = nullptr);
 
+  bool NeedFindInBlobCache(bool is_mem_iter, const Slice& value);
+
   DB* db_;
-  BasicCache* blob_cache_;
+  BlobCache* blob_cache_;
   Iterator* iter_;
   std::unique_ptr<ThreadPool> thread_pool_;
 };
 
-class ParseIteratorValue {
+class ParsedDBIterator {
  public:
-  explicit ParseIteratorValue();
+  ParsedDBIterator(BlobCache* cache);
 
-  ~ParseIteratorValue();
-
-  void Clear();
+  Status ParseValue(uint64_t blob_number, uint64_t blob_size,
+                    const Slice& decode_offset);
 
   std::string GetValue() const;
 
-  Status Parse(const Slice& from_value);
+  ~ParsedDBIterator();
 
  private:
-  std::string to_value_;
+  Iterator* iter_;
+  BlobCache* blob_cache_;
+  std::string save_to_value_;
 };
 
 }  // namespace leveldb
