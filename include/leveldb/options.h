@@ -145,9 +145,11 @@ struct LEVELDB_EXPORT Options {
 
   bool enable_garbage_collection = true;
 
-  GCPolicy gc_policy;
+  GCPolicy gc_policy = GCPolicy::kUseDiscardSize;
 
   double gc_threshold_ratio = 0.3;
+
+  size_t value_separation_threshold = 1024;  // kv分离阈值
 };
 
 // Options that control read operations
