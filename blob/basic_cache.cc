@@ -2,6 +2,7 @@
 #include "blob/basic_cache.h"
 
 #include "db/filename.h"
+#include <thread>
 #include <typeinfo>
 
 #include "leveldb/env.h"
@@ -15,14 +16,13 @@ namespace leveldb {
 static void DeleteEntry(const Slice& key, void* value) {
   BasicAndFile* basic_file = reinterpret_cast<BasicAndFile*>(value);
   if (basic_file->is_blob_file) {
-    BlobAndFile* bf = dynamic_cast<BlobAndFile*>(basic_file);
-    delete bf->blob;
-    delete bf->file;
+    assert(basic_file->table == nullptr);
+    delete basic_file->blob;
   } else {
-    TableAndFile* tf = dynamic_cast<TableAndFile*>(basic_file);
-    delete tf->table;
-    delete tf->file;
+    assert(basic_file->blob == nullptr);
+    delete basic_file->table;
   }
+  delete basic_file->file;
   delete basic_file;
 }
 
@@ -32,37 +32,29 @@ static void UnrefEntry(void* arg1, void* arg2) {
   cache->Release(h);
 }
 
-BasicAndFile::BasicAndFile() : file(nullptr), is_blob_file(false) {
-  if (typeid(this) == typeid(BlobAndFile)) {
-    is_blob_file = true;
-  }
-}
+BasicAndFile::BasicAndFile(bool is_blob_file)
+    : file(nullptr),
+      blob(nullptr),
+      table(nullptr),
+      is_blob_file(is_blob_file) {}
 
-BasicCache::BasicCache(const std::string& dbname, const Options& options,
-                       int entries)
-
+InternalCache::InternalCache(const std::string& dbname, const Options& options,
+                             int entries, bool is_blob_cache)
     : env_(options.env),
       dbname_(dbname),
       options_(options),
       cache_(NewLRUCache(entries)),
-      is_blob_cache_(false) {
-  if (typeid(this) == typeid(BlobCache)) {
-    is_blob_cache_ = true;
-  }
-}
+      is_blob_cache_(is_blob_cache) {}
 
-BasicCache::~BasicCache() { delete cache_; }
-
-Iterator* BasicCache::NewIterator(const ReadOptions& options,
-                                  uint64_t file_number, uint64_t file_size,
-                                  Table** tableptr) {
-  return nullptr;
+InternalCache::~InternalCache() {
+  delete cache_;
+  is_blob_cache_ = false;
 }
 
 // If a seek to internal key "k" in specified file finds an entry,
 // call (*handle_result)(arg, found_key, found_value).
-Status BasicCache::Find(uint64_t file_number, uint64_t file_size,
-                        Cache::Handle** handle) {
+Status InternalCache::Find(uint64_t file_number, uint64_t file_size,
+                           Cache::Handle** handle) {
   Status s;
   char buf[sizeof(file_number)];
   EncodeFixed64(buf, file_number);
@@ -72,19 +64,19 @@ Status BasicCache::Find(uint64_t file_number, uint64_t file_size,
     std::string fname;
     Table* table = nullptr;
     Blob* blob = nullptr;
-    if (is_blob_cache_ == false) {
-      fname = TableFileName(dbname_, file_number);
-    } else {
+    if (is_blob_cache_) {
       fname = BlobFileName(dbname_, file_number);
+    } else {
+      fname = TableFileName(dbname_, file_number);
     }
     RandomAccessFile* file = nullptr;
     s = env_->NewRandomAccessFile(fname, &file);
     if (!s.ok()) {
       std::string old_fname;
       if (is_blob_cache_) {
-        old_fname = SSTTableFileName(dbname_, file_number);
-      } else {
         old_fname = BlobFileName(dbname_, file_number);
+      } else {
+        old_fname = SSTTableFileName(dbname_, file_number);
       }
       if (env_->NewRandomAccessFile(old_fname, &file).ok()) {
         s = Status::OK();
@@ -97,7 +89,6 @@ Status BasicCache::Find(uint64_t file_number, uint64_t file_size,
         s = Table::Open(options_, file, file_size, &table);
       }
     }
-
     if (!s.ok()) {
       assert(table == nullptr);
       assert(blob == nullptr);
@@ -106,67 +97,57 @@ Status BasicCache::Find(uint64_t file_number, uint64_t file_size,
       // We do not cache error results so that if the error is transient,
       // or somebody repairs the file, we recover automatically.
     } else {
-      BasicAndFile* basic_file = nullptr;
+      BasicAndFile* basic_file = new BasicAndFile(is_blob_cache_);
       if (is_blob_cache_) {
-        basic_file = new BlobAndFile;
-        dynamic_cast<BlobAndFile*>(basic_file)->blob = blob;
+        basic_file->blob = blob;
       } else {
-        basic_file = new TableAndFile;
-        dynamic_cast<TableAndFile*>(basic_file)->table = table;
+        basic_file->table = table;
       }
       basic_file->file = file;
-      *handle = cache_->Insert(key, basic_file, 1, &DeleteEntry);
+      *handle = cache_->Insert(key, basic_file, 1, &DeleteEntry,
+                               HandleType::kBlockHandle, 0);
     }
   }
+
   return s;
 }
 
-Status BasicCache::Get(const ReadOptions& options, uint64_t file_number,
-                       uint64_t file_size, const Slice& k, void* arg,
-                       void (*handle_result)(void*, const Slice&,
-                                             const Slice&)) {
+Status InternalCache::Get(const ReadOptions& options, uint64_t file_number,
+                          uint64_t file_size, const Slice& k, void* arg,
+                          void (*handle_result)(void*, const Slice&,
+                                                const Slice&)) {
   Cache::Handle* handle = nullptr;
+  // mutex_.Lock(file_number);
   Status s = Find(file_number, file_size, &handle);
   if (s.ok()) {
     Table* t = nullptr;
     Blob* b = nullptr;
+    BasicAndFile* file = reinterpret_cast<BasicAndFile*>(cache_->Value(handle));
     if (is_blob_cache_) {
-      b = reinterpret_cast<BlobAndFile*>(cache_->Value(handle))->blob;
+      b = file->blob;
       s = b->InternalGet(options, k, arg, handle_result);
     } else {
-      t = reinterpret_cast<TableAndFile*>(cache_->Value(handle))->table;
+      t = file->table;
       s = t->InternalGet(options, k, arg, handle_result);
     }
     cache_->Release(handle);
   }
+  // mutex_.Unlock(file_number);
   return s;
 }
 
-void BasicCache::Evict(uint64_t file_number) {
+void InternalCache::Evict(uint64_t file_number) {
   char buf[sizeof(file_number)];
   EncodeFixed64(buf, file_number);
   cache_->Erase(Slice(buf, sizeof(buf)));
 }
 
-BlobCache::BlobCache(const std::string& dbname, const Options& options,
-                     int entries)
-    : BasicCache(dbname, options, entries) {}
-
-BlobCache::~BlobCache() {}
-
-TableCache::TableCache(const std::string& dbname, const Options& options,
-                       int entries)
-    : BasicCache(dbname, options, entries) {}
-
-TableCache::~TableCache() {}
-
-uint64_t TableCache::GetBlobNumber() const { return blob_number_; }
-
-uint64_t TableCache::GetBlobSize() const { return blob_size_; }
-
-Iterator* TableCache::NewIterator(const ReadOptions& options,
-                                  uint64_t file_number, uint64_t file_size,
-                                  Table** tableptr) {
+Iterator* InternalCache::NewIterator(const ReadOptions& options,
+                                     uint64_t file_number, uint64_t file_size,
+                                     Table** tableptr, Blob** blobptr) {
+  if (blobptr != nullptr) {
+    *blobptr = nullptr;
+  }
   if (tableptr != nullptr) {
     *tableptr = nullptr;
   }
@@ -177,15 +158,85 @@ Iterator* TableCache::NewIterator(const ReadOptions& options,
     return NewErrorIterator(s);
   }
 
-  Table* table = reinterpret_cast<TableAndFile*>(cache_->Value(handle))->table;
-  blob_number_ = table->GetBlobNumber();
-  blob_size_ = table->GetBlobSize();
-  Iterator* result = table->NewIterator(options);
+  BasicAndFile* file = reinterpret_cast<BasicAndFile*>(cache_->Value(handle));
+  Blob* blob = file->blob;
+  Table* table = file->table;
+  Iterator* result = nullptr;
+
+  if (is_blob_cache_) {
+    assert(table == nullptr);
+    result = blob->NewIterator(options);
+  } else {
+    assert(blob == nullptr);
+    result = table->NewIterator(options);
+  }
+
   result->RegisterCleanup(&UnrefEntry, cache_, handle);
+
+  if (blobptr != nullptr) {
+    *blobptr = blob;
+  }
   if (tableptr != nullptr) {
     *tableptr = table;
   }
+
   return result;
+}
+
+BlobCache::BlobCache(const std::string& dbname, const Options& options,
+                     int entries)
+    : internal_cache_(new InternalCache(dbname, options, entries, true)) {}
+
+Iterator* BlobCache::NewIterator(const ReadOptions& options,
+                                 uint64_t file_number, uint64_t file_size,
+                                 Blob** blobptr) {
+  return internal_cache_->NewIterator(options, file_number, file_size, nullptr,
+                                      blobptr);
+}
+
+Status BlobCache::Get(const ReadOptions& options, uint64_t file_number,
+                      uint64_t file_size, const Slice& k, void* arg,
+                      void (*handle_result)(void*, const Slice&,
+                                            const Slice&)) {
+  return internal_cache_->Get(options, file_number, file_size, k, arg,
+                              handle_result);
+}
+
+void BlobCache::Evict(uint64_t file_number) {
+  return internal_cache_->Evict(file_number);
+}
+
+Status BlobCache::Find(uint64_t file_number, uint64_t file_size,
+                       Cache::Handle** handle) {
+  return internal_cache_->Find(file_number, file_size, handle);
+}
+
+TableCache::TableCache(const std::string& dbname, const Options& options,
+                       int entries)
+    : internal_cache_(new InternalCache(dbname, options, entries, false)) {}
+
+Iterator* TableCache::NewIterator(const ReadOptions& options,
+                                  uint64_t file_number, uint64_t file_size,
+                                  Table** tableptr) {
+  return internal_cache_->NewIterator(options, file_number, file_size, tableptr,
+                                      nullptr);
+}
+
+Status TableCache::Get(const ReadOptions& options, uint64_t file_number,
+                       uint64_t file_size, const Slice& k, void* arg,
+                       void (*handle_result)(void*, const Slice&,
+                                             const Slice&)) {
+  return internal_cache_->Get(options, file_number, file_size, k, arg,
+                              handle_result);
+}
+
+void TableCache::Evict(uint64_t file_number) {
+  return internal_cache_->Evict(file_number);
+}
+
+Status TableCache::Find(uint64_t file_number, uint64_t file_size,
+                        Cache::Handle** handle) {
+  return internal_cache_->Find(file_number, file_size, handle);
 }
 
 }  // namespace leveldb
