@@ -23,6 +23,9 @@
 #include "leveldb/export.h"
 #include "leveldb/slice.h"
 
+#include "util/hashtable.h"
+#include "util/mutexlock.h"
+
 namespace leveldb {
 
 class LEVELDB_EXPORT Cache;
@@ -55,7 +58,8 @@ class LEVELDB_EXPORT Cache {
   // When the inserted entry is no longer needed, the key and
   // value will be passed to "deleter".
   virtual Handle* Insert(const Slice& key, void* value, size_t charge,
-                         void (*deleter)(const Slice& key, void* value)) = 0;
+                         void (*deleter)(const Slice& key, void* value),
+                         const HandleType& type, double caching_factor) = 0;
 
   // If the cache has no mapping for "key", returns nullptr.
   //
@@ -97,6 +101,8 @@ class LEVELDB_EXPORT Cache {
   // cache.
   virtual size_t TotalCharge() const = 0;
 
+  virtual bool Contains(const Slice& key) = 0;
+
  private:
   void LRU_Remove(Handle* e);
   void LRU_Append(Handle* e);
@@ -106,6 +112,64 @@ class LEVELDB_EXPORT Cache {
   Rep* rep_;
 };
 
+class LRUCache {
+ public:
+  LRUCache();
+  ~LRUCache();
+
+  // Separate from constructor so caller can easily make an array of LRUCache
+  void SetCapacity(size_t capacity) { capacity_ = capacity; }
+
+  // Like Cache methods, but with an extra "hash" parameter.
+  Cache::Handle* Insert(const Slice& key, uint32_t hash, void* value,
+                        size_t charge,
+                        void (*deleter)(const Slice& key, void* value),
+                        const HandleType& handle_type, double caching_factor);
+  Cache::Handle* Lookup(const Slice& key, uint32_t hash);
+  void Release(Cache::Handle* handle);
+  void Erase(const Slice& key, uint32_t hash);
+  void Prune();
+  size_t TotalCharge() const {
+    MutexLock l(&mutex_);
+    return usage_;
+  }
+  bool Contains(const Slice& key, uint32_t hash);
+  void UseCachingFactor() {
+    MutexLock l(&mutex_);
+    use_caching_factor_ = true;
+  }
+
+ private:
+  void LRU_Remove(LRUHandle* e);
+  void LRU_Append(LRUHandle* list, LRUHandle* e);
+  void Ref(LRUHandle* e);
+  void Unref(LRUHandle* e);
+  bool FinishErase(LRUHandle* e) EXCLUSIVE_LOCKS_REQUIRED(mutex_);
+
+  LRUHandle*
+  SelectSample();  //随机选择一定数量的handle 得到最小缓存因子的handle
+  // Initialized before use.
+  size_t capacity_;
+
+  // mutex_ protects the following state.
+  mutable port::Mutex mutex_;
+  size_t usage_ GUARDED_BY(mutex_);
+
+  // Dummy head of LRU list.
+  // lru.prev is newest entry, lru.next is oldest entry.
+  // Entries have refs==1 and in_cache==true.
+  LRUHandle lru_ GUARDED_BY(mutex_);
+
+  // Dummy head of in-use list.
+  // Entries are in use by clients, and have refs >= 2 and in_cache==true.
+  LRUHandle in_use_ GUARDED_BY(mutex_);
+
+  HandleTable table_ GUARDED_BY(mutex_);
+
+  size_t lru_length_ GUARDED_BY(mutex_);
+
+  bool use_caching_factor_ GUARDED_BY(mutex_);
+};
 }  // namespace leveldb
 
 #endif  // STORAGE_LEVELDB_INCLUDE_CACHE_H_
