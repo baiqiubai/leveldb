@@ -148,23 +148,23 @@ class LEVELDB_EXPORT DB {
   virtual void CompactRange(const Slice* begin, const Slice* end) = 0;
 
   //扫描从start开始的count个k-v对 如果没有出错结果放入result中
-  virtual Status ScanNumOfValue(const ReadOptions&, const Slice& start,
+  virtual Status ScanNumOfValue(const ReadOptions&, const Slice* start,
                                 uint32_t count,
                                 std::vector<std::string>* result) = 0;
 
   virtual Status ScanNumOfEntries(
-      const ReadOptions&, const Slice& start, uint32_t count,
+      const ReadOptions&, const Slice* start, uint32_t count,
       std::vector<std::pair<std::string, std::string>>* result) = 0;
 
   //扫描[start,end]区间的所有k-v对
-  //此处start为""代表从开始扫描到end
-  // end为""代表从start扫描到末尾 正向扫描
-  virtual Status ForwardScan(const ReadOptions&, const Slice& start,
-                             const Slice& end,
+  //此处start为nullptr代表从开始扫描到end
+  // end为nullptr代表从start扫描到末尾 正向扫描
+  virtual Status ForwardScan(const ReadOptions&, const Slice* start,
+                             const Slice* end,
                              std::vector<std::string>* result) = 0;
 
-  virtual Status BackwardScan(const ReadOptions&, const Slice& start,
-                              const Slice& end,
+  virtual Status BackwardScan(const ReadOptions&, const Slice* start,
+                              const Slice* end,
                               std::vector<std::string>* result) = 0;
 };
 

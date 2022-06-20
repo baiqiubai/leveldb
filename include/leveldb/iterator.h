@@ -15,6 +15,8 @@
 #ifndef STORAGE_LEVELDB_INCLUDE_ITERATOR_H_
 #define STORAGE_LEVELDB_INCLUDE_ITERATOR_H_
 
+#include <functional>
+
 #include "leveldb/export.h"
 #include "leveldb/slice.h"
 #include "leveldb/status.h"
@@ -78,6 +80,12 @@ class LEVELDB_EXPORT Iterator {
 
   virtual uint64_t GetBlobSize() const;
 
+  virtual bool IsMemIter() const;
+
+  virtual void SetIterType(bool is_mem_iter);
+
+  virtual void SetCallback(const std::function<void(bool)>& callback);
+
   // Clients are allowed to register function/arg1/arg2 triples that
   // will be invoked when this iterator is destroyed.
   //
@@ -105,6 +113,9 @@ class LEVELDB_EXPORT Iterator {
     CleanupNode* next;
   };
   CleanupNode cleanup_head_;
+
+ protected:
+  bool is_mem_iter_ = false;
 };
 
 // Return an empty iterator (yields nothing).
