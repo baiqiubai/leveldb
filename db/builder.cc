@@ -66,7 +66,35 @@ Status FlushBuilderAndRecordState(BlobWapper* blob_wapper,
   return s;
 }
 
-void UpdateAdaptiveCache(const Slice& key, const Slice& value, Cache** cache) {}
+void UpdateAdaptiveCache(const Slice& key, const Slice& value, Cache** cache,
+                         const KPValue& kpvalue) {
+  Cache::Handle* handle = (*cache)->Lookup(key);
+  LRUHandle* lru_handle = reinterpret_cast<LRUHandle*>(handle);
+
+  if (handle != nullptr) {
+    HandleType handle_type = lru_handle->handle_type;
+    size_t handle_size = key.size();
+    std::string* new_value = nullptr;
+
+    if (lru_handle->handle_type == HandleType::kKPHandle) {
+      std::string temp;
+      EncodeKPValue(&temp, kpvalue.blob_number, kpvalue.blob_size,
+                    kpvalue.blob_offset);
+      new_value = new std::string(temp);
+      handle_size += temp.size();
+    } else if (lru_handle->handle_type == HandleType::kKVHandle) {
+      new_value = new std::string(value.ToString());
+    }
+
+    double caching_factor = CalculateCachingFactor(0, handle_type, handle_size);
+
+    (*cache)->Release(handle);
+    handle = (*cache)->Insert(key, reinterpret_cast<void*>(new_value), 1,
+                              DeleteHandle, handle_type, caching_factor);
+
+    (*cache)->Release(handle);
+  }
+}
 
 Status BuildTable(const std::string& dbname, Env* env, const Options& options,
                   TableCache* table_cache, Iterator* iter, FileMetaData* meta,
@@ -125,6 +153,9 @@ Status BuildTable(const std::string& dbname, Env* env, const Options& options,
       if (is_separation) {
         blob_builder->Add(key, value);
       }
+      UpdateAdaptiveCache(
+          key, value, adaptive_cache,
+          KPValue(blob_meta->number, blob_meta->file_size, offset));
     }
 
     if (!key.empty()) {

@@ -60,9 +60,22 @@ struct SSTWapper {
   FileMetaData* meta;
 };
 
+namespace {
+struct KPValue {
+  KPValue(uint64_t blob_number, uint64_t blob_size, uint64_t blob_offset)
+      : blob_number(blob_number),
+        blob_size(blob_size),
+        blob_offset(blob_offset) {}
+  uint64_t blob_number;
+  uint64_t blob_size;
+  uint64_t blob_offset;
+};
+}  // namespace
+
 Status FlushBuilderAndRecordState(BlobWapper* blob_wapper,
                                   SSTWapper* sst_wapper);
-void UpdateAdaptiveCache(const Slice& key, const Slice& value, Cache** cache);
+void UpdateAdaptiveCache(const Slice& key, const Slice& value, Cache** cache,
+                         const KPValue& kpvalue);
 
 }  // namespace leveldb
 
