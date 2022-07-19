@@ -47,7 +47,11 @@ class BlobFileMetaData;
 int FindFile(const InternalKeyComparator& icmp,
              const std::vector<FileMetaData*>& files, const Slice& key,
              bool use_user_comparator = false);
-
+// 1.guards为空或者key小于第一个guard_key返回 -1
+// 2.key大于所有的guard_key则返回最后一个guard的下标
+// 3.否则返回key可能所在guard的下标
+int FindGuard(const InternalKeyComparator& icmp,
+              const std::vector<GuardMetaData*> guards, const Slice& key);
 // Returns true iff some file in "files" overlaps the user key range
 // [*smallest,*largest].
 // smallest==nullptr represents a key smaller than all keys in the DB.
@@ -61,6 +65,9 @@ bool SomeFileOverlapsRange(const InternalKeyComparator& icmp,
                            const Slice* largest_user_key);
 
 class Version {
+  friend Iterator* GetGuardFileIterator(void* arg, const ReadOptions& options,
+                                        const Slice& value_buf);
+
  public:
   // Lookup the value for key.  If found, store it in *val and
   // return OK.  Else return a non-OK status.  Fills *stats.
@@ -74,6 +81,8 @@ class Version {
   // yield the contents of this Version when merged together.
   // REQUIRES: This version has been saved (see VersionSet::SaveTo)
   void AddIterators(const ReadOptions&, std::vector<Iterator*>* iters);
+
+  void AddIteratorsForGuard(const ReadOptions&, std::vector<Iterator*>* iters);
 
   Status Get(const ReadOptions&, const LookupKey& key, std::string* val,
              GetStats* stats);
@@ -99,6 +108,17 @@ class Version {
       const InternalKey* begin,  // nullptr means before all keys
       const InternalKey* end,    // nullptr means after all keys
       std::vector<FileMetaData*>* inputs);
+  void GetOverlappingInputsForGuard(int level, const InternalKey* begin,
+                                    const InternalKey* end,
+                                    std::vector<FileMetaData*>* sentinel_files,
+                                    std::vector<GuardMetaData*>* guards);
+  void GetOverlappingWithSentinelFiles(
+      int level, const InternalKey* begin, const InternalKey* end,
+      std::vector<FileMetaData*>* sentinel_files);
+
+  void GetOverlappingWithGuards(int level, const InternalKey* begin,
+                                const InternalKey* end,
+                                std::vector<GuardMetaData*>* guards);
 
   // Returns true iff some file in the specified level overlaps
   // some part of [*smallest_user_key,*largest_user_key].
@@ -107,6 +127,8 @@ class Version {
   // DB's keys.
   bool OverlapInLevel(int level, const Slice* smallest_user_key,
                       const Slice* largest_user_key);
+  bool OverlapInLevelForGuard(int level, const Slice* smallest_user_key,
+                              const Slice* largest_user_key);
 
   // Return the level at which we should place a new memtable compaction
   // result that covers the range [smallest_user_key,largest_user_key].
@@ -118,11 +140,26 @@ class Version {
   // Return a human readable string that describes this version's contents.
   std::string DebugString() const;
 
+  void AddUnCommittedGuard(int level, GuardMetaData* guard) {
+    uncommitted_guard_[level].push_back(guard);
+  }
+
+  size_t NumGuardAtLevel(int level) const { return guards_[level].size(); }
+
+  size_t NumUnCommittedGuardAtLevel(int level) const {
+    return uncommitted_guard_[level].size();
+  }
+
+  size_t NumSentinelFilesAtLevel(int level) const {
+    return sentinel_files_[level].size();
+  }
+
  private:
   friend class Compaction;
   friend class VersionSet;
 
   class LevelFileNumIterator;
+  class LevelGuardNumIterator;
 
   explicit Version(VersionSet* vset)
       : vset_(vset),
@@ -141,6 +178,8 @@ class Version {
 
   Iterator* NewConcatenatingIterator(const ReadOptions&, int level) const;
 
+  Iterator* NewLevelGuardIterator(const ReadOptions&, int level) const;
+
   // Call func(arg, level, f) for every file that overlaps user_key in
   // order from newest to oldest.  If an invocation of func returns
   // false, makes no more calls.
@@ -154,8 +193,18 @@ class Version {
   Version* prev_;     // Previous version in linked list
   int refs_;          // Number of live refs to this version
 
+  std::vector<GuardMetaData*> uncommitted_guard_[config::kNumLevels];
+  std::vector<GuardMetaData*> guards_[config::kNumLevels];
+  std::vector<FileMetaData*> sentinel_files_[config::kNumLevels];
+
   // List of files per level
   std::vector<FileMetaData*> files_[config::kNumLevels];
+
+  std::vector<double> sentinel_guard_scores_{0, 0, 0, 0, 0, 0, 0};
+
+  std::vector<double> guard_scores_[config::kNumLevels];
+
+  std::vector<double> compaction_scores_{0, 0, 0, 0, 0, 0, 0};
 
   // Next file to compact based on seek stats.
   FileMetaData* file_to_compact_;
@@ -247,6 +296,8 @@ class VersionSet {
   Compaction* CompactRange(int level, const InternalKey* begin,
                            const InternalKey* end);
 
+  Compaction* CompactRangeForGuard(int level, const InternalKey* begin,
+                                   const InternalKey* end);
   // Return the maximum overlapping data (in bytes) at next level for any
   // file at a level >= 1.
   int64_t MaxNextLevelOverlappingBytes();
@@ -255,11 +306,15 @@ class VersionSet {
   // The caller should delete the iterator when no longer needed.
   Iterator* MakeInputIterator(Compaction* c);
 
+  Iterator* MakeInputIteratorForGuard(Compaction* c);
+
   // Returns true iff some level needs a compaction.
   bool NeedsCompaction() const {
     Version* v = current_;
     return (v->compaction_score_ >= 1) || (v->file_to_compact_ != nullptr);
   }
+
+  bool NeedsCompactionForGuard() const;
 
   // Add all files listed in any live version to *live.
   // May also mutate some internal state.
@@ -288,6 +343,20 @@ class VersionSet {
 
   void CleanGenerateBlobList() { generate_blob_files_.clear(); }
 
+  void PopBackBlobList() { generate_blob_files_.pop_back(); }
+
+  int PickCompactionLevel() const;
+
+  Compaction* GetInputGuardsAndFiles(
+      std::vector<GuardMetaData*>* uncommitted_guards, int level);
+
+  struct PackCacheAndComparator {
+    PackCacheAndComparator(TableCache* cache, const InternalKeyComparator* icmp)
+        : cache_(cache), icmp_(icmp) {}
+    TableCache* cache_;
+    const InternalKeyComparator* icmp_;
+  };
+
  private:
   class Builder;
 
@@ -311,6 +380,8 @@ class VersionSet {
   Status WriteSnapshot(log::Writer* log);
 
   void AppendVersion(Version* v);
+
+  void AdjustInputs(int level, Compaction* c);
 
   Env* const env_;
   const std::string dbname_;
@@ -337,6 +408,8 @@ class VersionSet {
   std::string compact_pointer_[config::kNumLevels];
 
   std::vector<uint64_t> generate_blob_files_;
+
+  PackCacheAndComparator pack_cache_and_comparator_;
 };
 
 // A Compaction encapsulates information about a compaction.
@@ -368,10 +441,14 @@ class Compaction {
   // Add all inputs to this compaction as delete operations to *edit.
   void AddInputDeletions(VersionEdit* edit);
 
+  void AddInputDeletionsForGuard(VersionEdit* edit);
+
   // Returns true if the information we have available guarantees that
   // the compaction is producing data in "level+1" for which no data exists
   // in levels greater than "level+1".
   bool IsBaseLevelForKey(const Slice& user_key);
+
+  bool IsBaseLevelForKeyForGuard(const Slice& user_key);
 
   // Returns true iff we should stop building the current output
   // before processing "internal_key".
@@ -394,6 +471,8 @@ class Compaction {
 
   // Each compaction reads inputs from "level_" and "level_+1"
   std::vector<FileMetaData*> inputs_[2];  // The two sets of inputs
+  std::vector<GuardMetaData*> guards_inputs[2];
+  std::vector<FileMetaData*> sentinel_files[2];
 
   // State used to check for number of overlapping grandparent files
   // (parent == level_ + 1, grandparent == level_ + 2)
@@ -403,6 +482,9 @@ class Compaction {
   int64_t overlapped_bytes_;  // Bytes of overlap between current output
                               // and grandparent files
 };
+
+Iterator* GetGuardFileIterator(void* arg, const ReadOptions& options,
+                               const Slice& value_buf);
 
 }  // namespace leveldb
 

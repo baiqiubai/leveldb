@@ -25,6 +25,21 @@ struct FileMetaData {
   InternalKey largest;   // Largest internal key served by table
 };
 
+struct GuardMetaData {
+  GuardMetaData() : refs(0), level(0), num_of_segments(0) {}
+
+  int refs;
+  int level;
+  uint64_t num_of_segments;
+
+  InternalKey guard_key;
+  InternalKey smallest_key;
+  InternalKey largest_key;
+
+  std::vector<FileMetaData*> files_meta;
+  std::vector<uint64_t> files_number;
+};
+
 struct BlobFileMetaData {
   BlobFileMetaData()
       : refs(0),
@@ -84,6 +99,16 @@ class VersionEdit {
     new_files_.push_back(std::make_pair(level, f));
   }
 
+  void AddNewGuard(int level, const GuardMetaData& guard) {
+    assert(level > 0);
+    new_guards_[level].push_back(guard);
+  }
+
+  void AddNewUncommittedGuard(int level, const GuardMetaData& guard) {
+    assert(level > 0);
+    new_uncommitted_guards_[level].push_back(guard);
+  }
+
   // Delete the specified "file" from the specified "level".
   void RemoveFile(int level, uint64_t file) {
     deleted_files_.insert(std::make_pair(level, file));
@@ -116,6 +141,9 @@ class VersionEdit {
   std::vector<std::pair<int, InternalKey>> compact_pointers_;
   DeletedFileSet deleted_files_;
   std::vector<std::pair<int, FileMetaData>> new_files_;
+
+  std::vector<GuardMetaData> new_uncommitted_guards_[config::kNumLevels];
+  std::vector<GuardMetaData> new_guards_[config::kNumLevels];
 };
 
 }  // namespace leveldb

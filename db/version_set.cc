@@ -89,6 +89,37 @@ Version::~Version() {
   }
 }
 
+int FindGuard(const InternalKeyComparator& icmp,
+              const std::vector<GuardMetaData*> guards, const Slice& key) {
+  int size = static_cast<int>(guards.size());
+  if (size == 0) {
+    return -1;
+  }
+
+  auto pos =
+      std::lower_bound(guards.begin(), guards.end(), key,
+                       [icmp](const GuardMetaData* guard, const Slice& key2) {
+                         return icmp.InternalKeyComparator::Compare(
+                                    guard->guard_key.Encode(), key2) < 0;
+                       });
+  if (pos == guards.end()) {
+    return size - 1;
+  } else {
+    int index = pos - guards.begin();
+    int r = icmp.InternalKeyComparator::Compare(
+        guards[index]->guard_key.Encode(), key);
+    if (r > 0) {
+      if (index == 0) {
+        return -1;
+      } else {
+        return index - 1;
+      }
+    }
+  }
+
+  return pos - guards.begin();
+}
+
 int FindFile(const InternalKeyComparator& icmp,
              const std::vector<FileMetaData*>& files, const Slice& key,
              bool use_user_comparator) {
@@ -134,6 +165,55 @@ static bool BeforeFile(const Comparator* ucmp, const Slice* user_key,
           ucmp->Compare(*user_key, f->smallest.user_key()) < 0);
 }
 
+bool SomeFileOverlapsRangeForGuard(
+    const InternalKeyComparator& icmp, bool is_level0,
+    const std::vector<FileMetaData*>& sentinels_file,
+    const std::vector<GuardMetaData*>& guards, const Slice* smallest_user_key,
+    const Slice* largest_user_key) {
+  const Comparator* ucmp = icmp.user_comparator();
+  if (!is_level0) {
+    // Need to check against all files
+    for (size_t i = 0; i < sentinels_file.size(); i++) {
+      const FileMetaData* f = sentinels_file[i];
+      if (AfterFile(ucmp, smallest_user_key, f) ||
+          BeforeFile(ucmp, largest_user_key, f)) {
+        // No overlap
+      } else {
+        return true;  // Overlap
+      }
+    }
+    return false;
+  }
+  int index = 0;
+  int guard_index = 0;
+  bool in_sentinel = false;
+  if (smallest_user_key != nullptr) {
+    // Find the earliest possible internal key for smallest_user_key
+    InternalKey small_key(*smallest_user_key, kMaxSequenceNumber,
+                          kValueTypeForSeek);
+    index = FindGuard(icmp, guards, small_key.Encode());
+
+    if (index == -1) {
+      in_sentinel = true;
+      index = FindFile(icmp, sentinels_file, small_key.Encode());
+    } else {
+      guard_index = index;
+      index = FindFile(icmp, guards[index]->files_meta, small_key.Encode());
+    }
+  }
+  if (in_sentinel) {
+    if (index >= sentinels_file.size()) {
+      return false;
+    }
+    return !BeforeFile(ucmp, largest_user_key, sentinels_file[index]);
+  }
+  if (index >= guards[index]->files_meta.size()) {
+    return false;
+  }
+  return !BeforeFile(ucmp, largest_user_key,
+                     guards[guard_index]->files_meta[index]);
+}
+
 bool SomeFileOverlapsRange(const InternalKeyComparator& icmp,
                            bool disjoint_sorted_files,
                            const std::vector<FileMetaData*>& files,
@@ -170,6 +250,138 @@ bool SomeFileOverlapsRange(const InternalKeyComparator& icmp,
 
   return !BeforeFile(ucmp, largest_user_key, files[index]);
 }
+
+class Version::LevelGuardNumIterator : public Iterator {
+ public:
+  using Vec = std::vector<std::pair<uint64_t, uint64_t>>;
+
+  LevelGuardNumIterator(const InternalKeyComparator& icmp,
+                        const std::vector<FileMetaData*>* sentinel_files,
+                        const std::vector<GuardMetaData*>* guards)
+      : icmp_(icmp),
+        sentinel_files_(sentinel_files),
+        guards_(guards),
+        guard_index_(1 + guards_->size()) {}  //置于无效位置
+
+  bool Valid() const override { return guard_index_ < 1 + guards_->size(); }
+
+  void SeekToFirst() override {
+    guard_index_ = 0;
+    DecodeSentinelFiles();
+  }
+  void SeekToLast() override {
+    if (!guards_->empty()) {
+      guard_index_ = guards_->size();
+    } else {
+      guard_index_ = 0;
+    }
+  }
+  void Seek(const Slice& target) override {
+    guard_index_ = FindGuard(icmp_, *guards_, target);
+    if (guard_index_ == -1) {
+      guard_index_ = 0;  //在sentinel_files中
+    } else {
+      guard_index_++;  //此处返回的是在guard中下标 需要越过sentinel_files
+    }
+    PutFileMetaInValueBuf(target);
+  }
+  void Next() override { guard_index_++; }
+  void Prev() override { guard_index_--; }
+
+  Slice key() const override {}
+  Slice value() const override { return EncodeValueBuf(); }
+
+  Status status() const override { return Status::OK(); }
+  uint64_t GetBlobNumber() const override { return kInValidBlobFileNumber; }
+  uint64_t GetBlobSize() const override { return kInValidBlobFileSize; }
+
+  static Vec DecodeValueBuf(const Slice& buf) {
+    Vec result;
+    uint64_t count = DecodeFixed64(buf.data());
+    if (count == 0) {
+      return result;
+    }
+
+    const char* start = buf.data() + sizeof(uint64_t);
+    while (count--) {
+      result.push_back(
+          {DecodeFixed64(start), DecodeFixed64(start + sizeof(uint64_t))});
+      start += 2 * sizeof(uint64_t);
+    }
+    return result;
+  }
+
+  int32_t GuardIndex() const { return guard_index_; }
+
+ private:
+  const InternalKeyComparator icmp_;
+  const std::vector<FileMetaData*>* const sentinel_files_;
+  const std::vector<GuardMetaData*>* const guards_;
+  int32_t guard_index_;  //指示在哪一个guard中 guard_index==0 在sentinel_files中
+
+  void DecodeSentinelFiles() {
+    for (size_t i = 0; i < sentinel_files_->size(); ++i) {
+      const FileMetaData* file_meta = (*sentinel_files_)[i];
+      value_buf_.push_back({file_meta->number, file_meta->file_size});
+    }
+    if (!value_buf_.empty()) {
+      value_buf_.push_back({value_buf_.size(), 0});
+    }
+  }
+
+  void PutFileMetaInValueBuf(const Slice& target) {
+    value_buf_.clear();
+    result_.clear();
+
+    if (guard_index_ == 0) {
+      for (size_t i = 0; i < sentinel_files_->size(); ++i) {
+        const FileMetaData* file_meta = (*sentinel_files_)[i];
+        if (icmp_.Compare(file_meta->smallest.Encode(), target) <= 0 &&
+            icmp_.Compare(file_meta->largest.Encode(), target) >= 0) {
+          value_buf_.push_back({file_meta->number, file_meta->file_size});
+        }
+      }
+    } else {
+      if (guard_index_ > guards_->size()) {
+        return;
+      }
+      int index = guard_index_;
+      --index;
+      std::vector<FileMetaData*>& files_meta = (*guards_)[index]->files_meta;
+      for (size_t i = 0; i < files_meta.size(); ++i) {
+        const FileMetaData* file_meta = files_meta[i];
+        if (icmp_.Compare(file_meta->smallest.Encode(), target) <= 0 &&
+            icmp_.Compare(file_meta->largest.Encode(), target) >= 0) {
+          value_buf_.push_back({file_meta->number, file_meta->file_size});
+        }
+      }
+    }
+    if (!value_buf_.empty()) {
+      value_buf_.push_back({value_buf_.size(), 0});  //总文件数量
+    }
+  }
+
+  Slice EncodeValueBuf()
+      const {  // format
+               // count->[file_number-file_size]->[file_number->file_size]
+    auto pos = value_buf_.rbegin();
+    if (pos != value_buf_.rend()) {
+      PutFixed64(&result_, pos->first);
+      ++pos;
+    }
+
+    for (; pos != value_buf_.rend(); ++pos) {
+      PutFixed64(&result_, pos->first);
+      PutFixed64(&result_, pos->second);
+    }
+    return result_;
+  }
+
+  mutable std::string result_;
+  //记录着可能存在目标key的文件的file_number以及file_size
+  //第一个参数为文件号第二个为文件大小 最后一个参数为总文件数量
+  mutable Vec value_buf_;
+};
 
 // An internal iterator.  For a given version/level pair, yields
 // information about the files in the level.  For a given entry, key()
@@ -246,11 +458,63 @@ static Iterator* GetFileIterator(void* arg, const ReadOptions& options,
   }
 }
 
+Iterator* GetGuardFileIterator(void* arg, const ReadOptions& options,
+                               const Slice& value_buf) {
+  VersionSet::PackCacheAndComparator* packing =
+      reinterpret_cast<VersionSet::PackCacheAndComparator*>(arg);
+  assert(packing);
+  TableCache* cache = packing->cache_;
+  assert(cache);
+  const InternalKeyComparator* icmp = packing->icmp_;
+  assert(icmp);
+
+  Version::LevelGuardNumIterator::Vec file_list =
+      Version::LevelGuardNumIterator::DecodeValueBuf(value_buf);
+  const int iter_size = file_list.size();
+  int num = 0;
+
+  Iterator** iter = new Iterator*[iter_size];
+  for (auto& [file_number, file_size] : file_list) {
+    iter[num] = cache->NewIterator(options, file_number, file_size);
+    if (!iter[num++]->status().ok()) {
+      delete[] iter;
+      return NewErrorIterator(Status::Corruption("iterator is empty"));
+    }
+  }
+  Iterator* result = NewMergingIterator(icmp, iter, iter_size);
+  delete[] iter;
+  return result;
+}
+
 Iterator* Version::NewConcatenatingIterator(const ReadOptions& options,
                                             int level) const {
   return NewTwoLevelIterator(
       new LevelFileNumIterator(vset_->icmp_, &files_[level]), &GetFileIterator,
       vset_->table_cache_, options);
+}
+
+Iterator* Version::NewLevelGuardIterator(const ReadOptions& options,
+                                         int level) const {
+  return NewTwoLevelIterator(
+      new LevelGuardNumIterator(vset_->icmp_, &sentinel_files_[level],
+                                &guards_[level]),
+      &GetGuardFileIterator, &vset_->pack_cache_and_comparator_, options);
+}
+
+void Version::AddIteratorsForGuard(const ReadOptions& options,
+                                   std::vector<Iterator*>* iters) {
+  // Merge all level zero files together since they may overlap
+  for (size_t i = 0; i < sentinel_files_[0].size(); i++) {
+    iters->push_back(vset_->table_cache_->NewIterator(
+        options, files_[0][i]->number, files_[0][i]->file_size));
+  }
+
+  for (int level = 1; level < config::kNumLevels; ++level) {
+    if (sentinel_files_[level].empty() && guards_[level].empty()) {
+      continue;
+    }
+    iters->push_back(NewLevelGuardIterator(options, level));
+  }
 }
 
 void Version::AddIterators(const ReadOptions& options,
@@ -302,15 +566,16 @@ void Version::ForEachOverlapping(Slice user_key, Slice internal_key, void* arg,
 
   // Search level-0 in order from newest to oldest.
   std::vector<FileMetaData*> tmp;
-  tmp.reserve(files_[0].size());
-  for (uint32_t i = 0; i < files_[0].size(); i++) {
-    FileMetaData* f = files_[0][i];
+  tmp.reserve(sentinel_files_[0].size());
+  for (uint32_t i = 0; i < sentinel_files_[0].size(); i++) {
+    FileMetaData* f = sentinel_files_[0][i];
     if (ucmp->Compare(user_key, f->smallest.user_key()) >= 0 &&
         ucmp->Compare(user_key, f->largest.user_key()) <= 0) {
       tmp.push_back(f);
     }
   }
   if (!tmp.empty()) {
+    Log(vset_->options_->info_log, "Find in level 0");
     std::sort(tmp.begin(), tmp.end(), NewestFirst);
     for (uint32_t i = 0; i < tmp.size(); i++) {
       if (!(*func)(arg, 0, tmp[i])) {
@@ -319,20 +584,33 @@ void Version::ForEachOverlapping(Slice user_key, Slice internal_key, void* arg,
     }
   }
 
-  // Search other levels.
-  for (int level = 1; level < config::kNumLevels; level++) {
-    size_t num_files = files_[level].size();
-    if (num_files == 0) continue;
+  for (int level = 1; level < config::kNumLevels; ++level) {
+    size_t num_of_guards = guards_[level].size();
 
-    // Binary search to find earliest index whose largest key >= internal_key.
-    uint32_t index = FindFile(vset_->icmp_, files_[level], internal_key);
-    if (index < num_files) {
-      FileMetaData* f = files_[level][index];
-      if (ucmp->Compare(user_key, f->smallest.user_key()) < 0) {
-        // All of "f" is past any data for user_key
-      } else {
-        if (!(*func)(arg, level, f)) {
-          return;
+    int index = FindGuard(vset_->icmp_, guards_[level], internal_key);
+    if (index == -1) {
+      size_t sentinel_size = sentinel_files_[level].size();
+
+      for (size_t i = 0; i < sentinel_size; ++i) {
+        if (ucmp->Compare(user_key,
+                          sentinel_files_[level][i]->smallest.user_key()) >=
+                0 &&
+            ucmp->Compare(user_key,
+                          sentinel_files_[level][i]->largest.user_key()) <= 0) {
+          if (!(*func)(arg, level, sentinel_files_[level][i])) {
+            return;
+          }
+        }
+      }
+    } else {
+      size_t file_size = guards_[level][index]->files_meta.size();
+      for (size_t i = 0; i < file_size; ++i) {
+        FileMetaData* file_meta = guards_[level][index]->files_meta[i];
+        if (ucmp->Compare(user_key, file_meta->smallest.user_key()) >= 0 &&
+            ucmp->Compare(user_key, file_meta->largest.user_key()) <= 0) {
+          if (!(*func)(arg, level, file_meta)) {
+            return;
+          }
         }
       }
     }
@@ -378,7 +656,9 @@ Status Version::Get(const ReadOptions& options, const LookupKey& k,
         if (lru_handle->hit_cache_type == HitCacheType::kKVRealCache) {
           state->saver.value->assign(value->data(), value->size());
           cache->Release(handle);
-        } else if (lru_handle->hit_cache_type == HitCacheType::kKPRealCache) {
+        } else if (lru_handle->hit_cache_type ==
+                   HitCacheType::kKPRealCache) {  //击中kpcache
+                                                  //提升kpcache为kvcache
           uint64_t blob_number = 0;
           uint64_t blob_file_size = 0;
 
@@ -445,8 +725,7 @@ Status Version::Get(const ReadOptions& options, const LookupKey& k,
       }
 
       HitCacheType hit_cache_type = HitCacheType::kNoHitCache;
-      SearchInAdaptiveCache(state, state->ikey, &hit_cache_type,
-                            level);  //首先在KP以及KVCache中查找
+      SearchInAdaptiveCache(state, state->ikey, &hit_cache_type, level);
 
       //没有查到或者击中幽灵缓存 需要走sst->blob
       if (hit_cache_type != HitCacheType::kKVRealCache &&
@@ -456,6 +735,7 @@ Status Version::Get(const ReadOptions& options, const LookupKey& k,
         state->s = state->vset->table_cache_->Get(*state->options, f->number,
                                                   f->file_size, state->ikey,
                                                   &state->saver, GetValueState);
+
         if (state->saver.state == kFound) {
           if (state->saver.blob_offset.compare(Slice()) != 0) {  //进行了KV分离
             SearchInBlobCache(reinterpret_cast<void*>(state),
@@ -579,6 +859,13 @@ bool Version::OverlapInLevel(int level, const Slice* smallest_user_key,
                                smallest_user_key, largest_user_key);
 }
 
+bool Version::OverlapInLevelForGuard(int level, const Slice* smallest_user_key,
+                                     const Slice* largest_user_key) {
+  return SomeFileOverlapsRangeForGuard(vset_->icmp_, (level > 0),
+                                       sentinel_files_[level], guards_[level],
+                                       smallest_user_key, largest_user_key);
+}
+
 int Version::PickLevelForMemTableOutput(const Slice& smallest_user_key,
                                         const Slice& largest_user_key) {
   int level = 0;
@@ -604,6 +891,56 @@ int Version::PickLevelForMemTableOutput(const Slice& smallest_user_key,
     }
   }
   return level;
+}
+
+void Version::GetOverlappingWithSentinelFiles(
+    int level, const InternalKey* begin, const InternalKey* end,
+    std::vector<FileMetaData*>* inputs) {
+  for (size_t i = 0; i < sentinel_files_[level].size(); ++i) {
+    const InternalKey& smallest = sentinel_files_[level][i]->smallest;
+    const InternalKey& largest = sentinel_files_[level][i]->largest;
+    if (begin != nullptr && vset_->icmp_.InternalKeyComparator::Compare(
+                                begin->Encode(), largest.Encode()) > 0) {
+    } else if (end != nullptr && vset_->icmp_.InternalKeyComparator::Compare(
+                                     end->Encode(), smallest.Encode()) < 0) {
+    } else {
+      inputs->emplace_back(sentinel_files_[level][i]);
+    }
+  }
+}
+
+void Version::GetOverlappingWithGuards(int level, const InternalKey* begin,
+                                       const InternalKey* end,
+                                       std::vector<GuardMetaData*>* inputs) {
+  for (size_t i = 0; i < guards_[level].size(); ++i) {
+    GuardMetaData* guard = guards_[level][i];
+    const std::vector<FileMetaData*>& files = guard->files_meta;
+    for (size_t i = 0; i < files.size(); ++i) {
+      const InternalKey& smallest = files[i]->smallest;
+      const InternalKey& largest = files[i]->largest;
+      if (begin != nullptr && vset_->icmp_.InternalKeyComparator::Compare(
+                                  begin->Encode(), largest.Encode()) > 0) {
+      } else if (end != nullptr && vset_->icmp_.InternalKeyComparator::Compare(
+                                       end->Encode(), smallest.Encode()) < 0) {
+      } else {
+        inputs->emplace_back(guard);
+        break;
+      }
+    }
+  }
+}
+
+void Version::GetOverlappingInputsForGuard(
+    int level, const InternalKey* begin, const InternalKey* end,
+    std::vector<FileMetaData*>* sentinel_files,
+    std::vector<GuardMetaData*>* guards) {
+  assert(level >= 0);
+  assert(level < config::kNumLevels);
+  sentinel_files->clear();
+  guards->clear();
+
+  GetOverlappingWithSentinelFiles(level, begin, end, sentinel_files);
+  GetOverlappingWithGuards(level, begin, end, guards);
 }
 
 // Store in "*inputs" all files in "level" that overlap [begin,end]
@@ -695,45 +1032,110 @@ class VersionSet::Builder {
     }
   };
 
+  struct BySmallestGuardKey {
+    const InternalKeyComparator* internal_comparator;
+
+    bool operator()(GuardMetaData* guard1, GuardMetaData* guard2) const {
+      return internal_comparator->Compare(guard1->guard_key,
+                                          guard2->guard_key) < 0;
+    }
+  };
+
+  struct BySmallestInternalKey {
+    const InternalKeyComparator* internal_comparactor;
+    bool operator()(InternalKey key1, InternalKey key2) const {
+      return internal_comparactor->Compare(key1, key2) < 0;
+    }
+  };
+
   typedef std::set<FileMetaData*, BySmallestKey> FileSet;
+  typedef std::set<GuardMetaData*, BySmallestGuardKey> GuardSet;
   struct LevelState {
     std::set<uint64_t> deleted_files;
+    std::set<InternalKey, BySmallestInternalKey> deleted_guards;
     FileSet* added_files;
+    GuardSet* added_guards_;
+    GuardSet* added_uncommitted_guards_;
   };
 
   VersionSet* vset_;
   Version* base_;
   LevelState levels_[config::kNumLevels];
 
+  void UnrefGuard(std::vector<GuardMetaData*>* guards) {
+    for (size_t i = 0; i < guards->size(); i++) {
+      GuardMetaData* guard = (*guards)[i];
+      guard->refs--;
+      if (guard->refs <= 0) {
+        delete guard;
+      }
+    }
+  }
+
+  void UnrefFile(std::vector<FileMetaData*>* files) {
+    for (size_t i = 0; i < files->size(); i++) {
+      FileMetaData* f = (*files)[i];
+      f->refs--;
+      if (f->refs <= 0) {
+        delete f;
+      }
+    }
+  }
+
  public:
-  // Initialize a builder with the files from *base and other info from *vset
+  // Initialize a builder with the files from *base and other info from
+  // *vset
   Builder(VersionSet* vset, Version* base) : vset_(vset), base_(base) {
     base_->Ref();
     BySmallestKey cmp;
+    BySmallestGuardKey guard_cmp;
     cmp.internal_comparator = &vset_->icmp_;
+    guard_cmp.internal_comparator = &vset_->icmp_;
     for (int level = 0; level < config::kNumLevels; level++) {
       levels_[level].added_files = new FileSet(cmp);
+      levels_[level].added_guards_ = new GuardSet(guard_cmp);
+      levels_[level].added_uncommitted_guards_ = new GuardSet(guard_cmp);
     }
   }
 
   ~Builder() {
     for (int level = 0; level < config::kNumLevels; level++) {
       const FileSet* added = levels_[level].added_files;
+      const GuardSet* added_guard = levels_[level].added_guards_;
+      const GuardSet* added_uncommitted_guard =
+          levels_[level].added_uncommitted_guards_;
+      assert(added);
+      assert(added_guard);
+      assert(added_uncommitted_guard);
+
       std::vector<FileMetaData*> to_unref;
+      std::vector<GuardMetaData*> guard_to_unref, uncommitted_guard_to_unref;
       to_unref.reserve(added->size());
+      guard_to_unref.reserve(added_guard->size());
+      uncommitted_guard_to_unref.reserve(added_uncommitted_guard->size());
       for (FileSet::const_iterator it = added->begin(); it != added->end();
            ++it) {
         to_unref.push_back(*it);
       }
-      delete added;
-      for (uint32_t i = 0; i < to_unref.size(); i++) {
-        FileMetaData* f = to_unref[i];
-        f->refs--;
-        if (f->refs <= 0) {
-          delete f;
-        }
+      for (GuardSet::const_iterator it = added_guard->begin();
+           it != added_guard->end(); ++it) {
+        guard_to_unref.push_back(*it);
       }
+      for (GuardSet::const_iterator it = added_uncommitted_guard->begin();
+           it != added_uncommitted_guard->end(); ++it) {
+        uncommitted_guard_to_unref.push_back(*it);
+      }
+      delete added;
+      delete added_guard;
+      delete added_uncommitted_guard;
+      added = nullptr;
+      added_guard = nullptr;
+      added_uncommitted_guard = nullptr;
+      UnrefFile(&to_unref);
+      UnrefGuard(&guard_to_unref);
+      UnrefGuard(&uncommitted_guard_to_unref);
     }
+
     base_->Unref();
   }
 
@@ -778,10 +1180,67 @@ class VersionSet::Builder {
       levels_[level].deleted_files.erase(f->number);
       levels_[level].added_files->insert(f);
     }
+
+    for (size_t i = 0; i < edit->new_guards_->size(); ++i) {
+      const std::vector<GuardMetaData>& guards = edit->new_guards_[i];
+      for (size_t j = 0; j < guards.size(); ++j) {
+        const int level = guards[j].level;
+        GuardMetaData* guard = new GuardMetaData(guards[j]);
+        levels_[level].added_guards_->insert(guard);
+      }
+    }
+
+    for (size_t i = 0; i < edit->new_uncommitted_guards_->size(); ++i) {
+      const std::vector<GuardMetaData>& guards =
+          edit->new_uncommitted_guards_[i];
+      for (size_t j = 0; j < guards.size(); ++j) {
+        const int level = guards[j].level;
+        GuardMetaData* guard = new GuardMetaData(guards[j]);
+        levels_[level].added_uncommitted_guards_->insert(guard);
+      }
+    }
   }
 
-  // Save the current state in *v.
-  void SaveTo(Version* v) {
+  void SaveUnCommittedGuard(Version* v) { SaveGuardMeta(v, true); }
+  void SaveGuard(Version* v) { SaveGuardMeta(v, false); }
+
+  void SaveGuardMeta(Version* v, bool save_uncommitted_guard) {
+    BySmallestGuardKey guard_cmp;
+    guard_cmp.internal_comparator = &vset_->icmp_;
+    std::vector<GuardMetaData*>* real_guards = nullptr;
+    if (!save_uncommitted_guard) {
+      real_guards = base_->guards_;
+    } else {
+      real_guards = base_->uncommitted_guard_;
+    }
+    for (int level = 0; level < config::kNumLevels; level++) {
+      const std::vector<GuardMetaData*>& base_guards = real_guards[level];
+      std::vector<GuardMetaData*>::const_iterator base_iter =
+          base_guards.begin();
+      std::vector<GuardMetaData*>::const_iterator base_end = base_guards.end();
+      const GuardSet* added_guards = levels_[level].added_guards_;
+      v->guards_[level].reserve(base_guards.size() + added_guards->size());
+
+      for (const auto& added_guard : *added_guards) {
+        // Add all smaller guard listed in base_
+        for (std::vector<GuardMetaData*>::const_iterator bpos =
+                 std::upper_bound(base_iter, base_end, added_guard, guard_cmp);
+             base_iter != bpos; ++base_iter) {
+          MaybeAddGuard(v, level, *base_iter, save_uncommitted_guard);
+        }
+
+        MaybeAddGuard(v, level, added_guard, save_uncommitted_guard);
+      }
+
+      // Add remaining base files
+      for (; base_iter != base_end; ++base_iter) {
+        MaybeAddGuard(v, level, *base_iter, save_uncommitted_guard);
+      }
+      if (save_uncommitted_guard) SaveSentinelFile(v, level);
+    }
+  }
+
+  void SaveFileMeta(Version* v) {
     BySmallestKey cmp;
     cmp.internal_comparator = &vset_->icmp_;
     for (int level = 0; level < config::kNumLevels; level++) {
@@ -807,23 +1266,56 @@ class VersionSet::Builder {
       for (; base_iter != base_end; ++base_iter) {
         MaybeAddFile(v, level, *base_iter);
       }
-
-#ifndef NDEBUG
-      // Make sure there is no overlap in levels > 0
-      if (level > 0) {
-        for (uint32_t i = 1; i < v->files_[level].size(); i++) {
-          const InternalKey& prev_end = v->files_[level][i - 1]->largest;
-          const InternalKey& this_begin = v->files_[level][i]->smallest;
-          if (vset_->icmp_.Compare(prev_end, this_begin) >= 0) {
-            std::fprintf(stderr, "overlapping ranges in same level %s vs. %s\n",
-                         prev_end.DebugString().c_str(),
-                         this_begin.DebugString().c_str());
-            std::abort();
-          }
-        }
-      }
-#endif
     }
+  }
+
+  void SaveSentinelFile(Version* v, int level) {
+    const std::vector<GuardMetaData*>& guards = v->guards_[level];
+    std::vector<FileMetaData*>* base_sentinel_files =
+        &v->sentinel_files_[level];
+    if (guards.size() == 0) {
+      for (size_t i = 0; i < v->files_[level].size(); ++i) {
+        base_sentinel_files->push_back(v->files_[level][i]);
+      }
+      return;
+    }
+
+    int guard_index = 0;
+    size_t num_of_files = v->files_[level].size();
+
+    for (size_t i = 0; i < num_of_files; ++i) {
+      while (guard_index == 0 && i < num_of_files &&
+             vset_->icmp_.Compare(guards[guard_index]->guard_key,
+                                  v->files_[level][i]->largest) > 0) {
+        base_sentinel_files->push_back(v->files_[level][i]);
+        ++i;
+      }
+      if (guard_index == 0) {
+        ++guard_index;
+      }
+      if (vset_->icmp_.Compare(guards[guard_index]->guard_key,
+                               v->files_[level][i]->largest) >= 0) {
+        if (guards[guard_index]->num_of_segments == 0) {
+          guards[guard_index]->smallest_key = v->files_[level][i]->smallest;
+          guards[guard_index]->level = level;
+        }
+
+        guards[guard_index]->num_of_segments++;
+        guards[guard_index]->files_meta.push_back(v->files_[level][i]);
+        guards[guard_index]->files_number.push_back(
+            v->files_[level][i]->number);
+        guards[guard_index]->largest_key = v->files_[level][i]->largest;
+      } else {
+        ++guard_index;
+      }
+    }
+  }
+
+  // Save the current state in *v.
+  void SaveTo(Version* v) {
+    SaveFileMeta(v);
+    SaveUnCommittedGuard(v);
+    SaveGuard(v);
   }
 
   void MaybeAddFile(Version* v, int level, FileMetaData* f) {
@@ -831,13 +1323,33 @@ class VersionSet::Builder {
       // File is deleted: do nothing
     } else {
       std::vector<FileMetaData*>* files = &v->files_[level];
+      /*
       if (level > 0 && !files->empty()) {
         // Must not overlap
         assert(vset_->icmp_.Compare((*files)[files->size() - 1]->largest,
                                     f->smallest) < 0);
-      }
+      }*/
       f->refs++;
       files->push_back(f);
+    }
+  }
+  void MaybeAddGuard(Version* v, int level, GuardMetaData* guard,
+                     bool save_uncommitted_guard) {
+    std::vector<GuardMetaData*>* guards = nullptr;
+    if (save_uncommitted_guard) {
+      guards = &v->uncommitted_guard_[level];
+    } else {
+      guards = &v->guards_[level];
+    }
+
+    if (levels_[level].deleted_guards.count(guard->guard_key) > 0) {
+    } else {
+      if (level > 0 && !guards->empty()) {
+        assert(vset_->icmp_.Compare((*guards)[guards->size() - 1]->guard_key,
+                                    guard->guard_key) < 0);
+      }
+      guard->refs++;
+      guards->push_back(guard);
     }
   }
 };
@@ -861,7 +1373,8 @@ VersionSet::VersionSet(const std::string& dbname, const Options* options,
       descriptor_file_(nullptr),
       descriptor_log_(nullptr),
       dummy_versions_(this),
-      current_(nullptr) {
+      current_(nullptr),
+      pack_cache_and_comparator_(table_cache_, &icmp_) {
   AppendVersion(new Version(this));
 }
 
@@ -1015,7 +1528,9 @@ Status VersionSet::Recover(bool* save_manifest) {
   uint64_t log_number = 0;
   uint64_t prev_log_number = 0;
   uint64_t max_blob_number = 0;
+
   Builder builder(this, current_);
+
   int read_records = 0;
 
   {
@@ -1023,6 +1538,7 @@ Status VersionSet::Recover(bool* save_manifest) {
     reporter.status = &s;
     log::Reader reader(file, &reporter, true /*checksum*/,
                        0 /*initial_offset*/);
+
     Slice record;
     std::string scratch;
     while (reader.ReadRecord(&record, &scratch) && s.ok()) {
@@ -1091,8 +1607,9 @@ Status VersionSet::Recover(bool* save_manifest) {
   if (s.ok()) {
     Version* v = new Version(this);
     builder.SaveTo(v);
+
     // Install recovered version
-    Finalize(v);
+    Finalize(v);  // bug
     AppendVersion(v);
     manifest_file_number_ = next_file;
     next_file_number_ = next_file + 1;
@@ -1112,7 +1629,6 @@ Status VersionSet::Recover(bool* save_manifest) {
     Log(options_->info_log, "Error recovering version set with %d records: %s",
         read_records, error.c_str());
   }
-
   return s;
 }
 
@@ -1158,8 +1674,9 @@ void VersionSet::Finalize(Version* v) {
   int best_level = -1;
   double best_score = -1;
 
-  for (int level = 0; level < config::kNumLevels - 1; level++) {
-    double score;
+  for (int level = 0; level < config::kNumLevels; level++) {
+    double score = 0.0;
+    double max_level_score = 0.0;
     if (level == 0) {
       // We treat level-0 specially by bounding the number of files
       // instead of number of bytes for two reasons:
@@ -1172,27 +1689,48 @@ void VersionSet::Finalize(Version* v) {
       // file size is small (perhaps because of a small write-buffer
       // setting, or very high compression ratios, or lots of
       // overwrites/deletions).
+
       score = v->files_[level].size() /
               static_cast<double>(config::kL0_CompactionTrigger);
+
+      size_t sentinel_size = v->sentinel_files_[level].size();
+      double sentinel_score =
+          static_cast<double>(sentinel_size) / config::kL0_MaxSentinelFiles;
+      v->sentinel_guard_scores_[level] = sentinel_score;
+      v->compaction_scores_[level] = sentinel_score;
     } else {
+      /*
       // Compute the ratio of current size to size limit.
       const uint64_t level_bytes = TotalFileSize(v->files_[level]);
       score =
-          static_cast<double>(level_bytes) / MaxBytesForLevel(options_, level);
-    }
+          static_cast<double>(level_bytes) / MaxBytesForLevel(options_,
+      level);
+      */
 
-    if (score > best_score) {
-      best_level = level;
-      best_score = score;
+      size_t sentinel_size = v->sentinel_files_[level].size();
+      double sentinel_score =
+          static_cast<double>(sentinel_size) / config::kMaxFilesPerGuard;
+      v->sentinel_guard_scores_[level] = sentinel_score;
+      max_level_score = sentinel_score;
+
+      for (size_t i = 0; i < v->guards_[level].size(); ++i) {
+        size_t num_of_files = v->guards_[level][i]->files_meta.size();
+        double temp_score =
+            static_cast<double>(num_of_files) / config::kMaxFilesPerGuard;
+        v->guard_scores_[level].push_back(temp_score);
+        max_level_score = std::max(max_level_score, temp_score);
+      }
+      v->compaction_scores_[level] = max_level_score;
     }
+    /*
+    v->compaction_level_ = best_level;
+    v->compaction_score_ = best_score;*/
   }
-
-  v->compaction_level_ = best_level;
-  v->compaction_score_ = best_score;
 }
 
 Status VersionSet::WriteSnapshot(log::Writer* log) {
-  // TODO: Break up into multiple records to reduce memory usage on recovery?
+  // TODO: Break up into multiple records to reduce memory usage on
+  // recovery?
 
   // Save metadata
   VersionEdit edit;
@@ -1352,6 +1890,47 @@ void VersionSet::GetRange2(const std::vector<FileMetaData*>& inputs1,
   GetRange(all, smallest, largest);
 }
 
+Iterator* VersionSet::MakeInputIteratorForGuard(Compaction* c) {
+  ReadOptions options;
+  options.verify_checksums = options_->paranoid_checks;
+  options.fill_cache = false;
+
+  // Level-0 files have to be merged together.  For other levels,
+  // we will make a concatenating iterator per level.
+  // TODO(opt): use concatenating iterator for level-0 if there is no
+  // overlap
+  const int space = (c->level() == 0 ? c->sentinel_files[0].size() + 1 : 2);
+  Iterator** list = new Iterator*[space];
+  int num = 0;
+  for (int which = 0; which < 2; which++) {
+    if (!c->sentinel_files[which].empty()) {
+      if (c->level() + which == 0) {
+        Log(options_->info_log, "level-0 files %ld",
+            c->sentinel_files[which].size());
+        const std::vector<FileMetaData*>& files = c->sentinel_files[which];
+        for (size_t i = 0; i < files.size(); i++) {
+          list[num++] = table_cache_->NewIterator(options, files[i]->number,
+                                                  files[i]->file_size);
+        }
+      } else {
+        Log(options_->info_log,
+            "level-%d sentinel_files size:%ld,guard size:%ld",
+            c->level() + which, c->sentinel_files[which].size(),
+            c->guards_inputs[which].size());
+        const std::vector<FileMetaData*>& files = c->sentinel_files[which];
+        const std::vector<GuardMetaData*>& guards = c->guards_inputs[which];
+        list[num++] = NewTwoLevelIterator(
+            new Version::LevelGuardNumIterator(icmp_, &files, &guards),
+            &GetGuardFileIterator, &pack_cache_and_comparator_, options);
+      }
+    }
+  }
+  assert(num <= space);
+  Iterator* result = NewMergingIterator(&icmp_, list, num);
+  delete[] list;
+  return result;
+}
+
 Iterator* VersionSet::MakeInputIterator(Compaction* c) {
   ReadOptions options;
   options.verify_checksums = options_->paranoid_checks;
@@ -1359,7 +1938,8 @@ Iterator* VersionSet::MakeInputIterator(Compaction* c) {
 
   // Level-0 files have to be merged together.  For other levels,
   // we will make a concatenating iterator per level.
-  // TODO(opt): use concatenating iterator for level-0 if there is no overlap
+  // TODO(opt): use concatenating iterator for level-0 if there is no
+  // overlap
   const int space = (c->level() == 0 ? c->inputs_[0].size() + 1 : 2);
   Iterator** list = new Iterator*[space];
   int num = 0;
@@ -1383,6 +1963,148 @@ Iterator* VersionSet::MakeInputIterator(Compaction* c) {
   Iterator* result = NewMergingIterator(&icmp_, list, num);
   delete[] list;
   return result;
+}
+
+bool VersionSet::NeedsCompactionForGuard() const {
+  return PickCompactionLevel() != -1;
+}
+
+int VersionSet::PickCompactionLevel() const {
+  for (int level = 0; level < config::kNumLevels - 2; ++level) {
+    double score = current_->compaction_scores_[level];
+    if (current_->compaction_scores_[level] >= 1.0 &&
+        current_->compaction_scores_[level + 1] < 1.0) {
+      return level;
+    }
+  }
+  if (current_->compaction_scores_[config::kNumLevels] - 1 >= 1.0) {
+    return config::kNumLevels - 1;
+  }
+  return -1;
+}
+
+Compaction* VersionSet::GetInputGuardsAndFiles(
+    std::vector<GuardMetaData*>* uncommitted_guards, int level) {
+  if (level == config::kNumLevels - 1) {     //最后一层
+  } else if (level != config::kNumLevels) {  //利用下一层的guards进行分割
+    for (size_t i = 0; i < current_->uncommitted_guard_[level + 1].size();
+         ++i) {
+      uncommitted_guards->push_back(current_->uncommitted_guard_[level + 1][i]);
+    }
+  }
+
+  Compaction* c = new Compaction(options_, level);
+  c->input_version_ = current_;
+  c->input_version_->Ref();
+
+  const int input_level_num = 2;
+
+  for (int which = 0; which < input_level_num; ++which) {
+    if (which + level >= config::kNumLevels) {
+      continue;
+    }
+
+    std::vector<GuardMetaData*>& uncommitted_guards =
+        c->input_version_->uncommitted_guard_[which + level];
+    std::vector<GuardMetaData*>& guards =
+        c->input_version_->guards_[which + level];
+    std::vector<FileMetaData*>& sentinel_files =
+        c->input_version_->sentinel_files_[which + level];
+
+    GuardMetaData* first_uncommitted_guard = nullptr;
+    if (uncommitted_guards.size() > 0) {
+      first_uncommitted_guard = uncommitted_guards[0];
+    }
+    size_t sentinel_files_size = sentinel_files.size();
+    bool add_all_sentinel_files = false;
+
+    //挑选sentinel_files
+    for (
+        size_t i = 0; i < sentinel_files_size;
+        ++i) {  //如果第一个uncommitted guard 与sentinel_files中一个文件有交集
+                //则需要进行compaction因为sentinel_files中所有文件key必须严格小于第一个guard
+      if (first_uncommitted_guard != nullptr &&
+          icmp_.Compare(sentinel_files[i]->largest,
+                        first_uncommitted_guard->guard_key) >= 0) {
+        add_all_sentinel_files = true;
+        break;
+      }
+    }
+
+    //有可能该层还没有选出来uncommitted_guard 但是score已经满足compaction条件
+    if (add_all_sentinel_files == false && first_uncommitted_guard == nullptr &&
+        current_->compaction_scores_[level + which] >= 1.0) {
+      add_all_sentinel_files = true;
+    }
+
+    //挑选guards
+    size_t next_start_index = 0;
+    size_t guards_size = guards.size();
+    size_t uncommitted_guards_size = uncommitted_guards.size();
+    std::vector<GuardMetaData*> added_all_guards;
+
+    //此处uncommitted_guards的数量
+    //必然大于等于guards的数量 guards是经过uncommitted_guards持久化得来
+    for (size_t i = 0; i < uncommitted_guards_size; ++i) {
+      GuardMetaData* uncommitted_guard = uncommitted_guards[i];
+
+      GuardMetaData* first_guard = uncommitted_guards[i];
+      GuardMetaData* last_guard = nullptr;
+      if (i != uncommitted_guards_size - 1) {
+        last_guard = uncommitted_guards[i + 1];
+      }
+
+      int guard_index = -1;
+      while (next_start_index < guards_size) {
+        int result = icmp_.Compare(guards[next_start_index]->guard_key,
+                                   uncommitted_guard->guard_key);
+        if (result == 0) {
+          guard_index = result;
+          ++next_start_index;
+          break;
+        } else if (result > 0) {
+          break;
+        } else {
+        }
+      }
+      if (guard_index == -1) {
+        continue;
+      }
+
+      //从挑选出来的guards中判断文件是否满足guards不相交的特性
+      //不满足则需要compaction
+      bool add_all_guards_file = false;
+
+      for (size_t i = 0; i < guards[guard_index]->files_meta.size(); ++i) {
+        const InternalKey smallest =
+            guards[guard_index]->files_meta[i]->smallest;
+        const InternalKey largest = guards[guard_index]->files_meta[i]->largest;
+        //如果该guards中有文件不满足之后uncommitted_guards的范围则进行compaction
+        if ((guard_index < uncommitted_guards_size - 1 &&
+             (icmp_.Compare(smallest, first_guard->guard_key) < 0 ||
+              icmp_.Compare(largest, last_guard->guard_key) <= 0)) ||
+            (guard_index == uncommitted_guards_size - 1 &&
+             icmp_.Compare(smallest, first_guard->guard_key) < 0)) {
+          added_all_guards.push_back(guards[guard_index]);
+          break;
+        }
+      }
+    }
+    if (add_all_sentinel_files) {
+      for (size_t i = 0; i < sentinel_files_size; ++i) {
+        c->sentinel_files[which].push_back(sentinel_files[i]);
+        c->inputs_[which].push_back(sentinel_files[i]);
+      }
+    }
+    for (size_t i = 0; i < added_all_guards.size(); ++i) {
+      const GuardMetaData* guard = added_all_guards[i];
+      for (size_t j = 0; j < guard->files_meta.size(); ++j) {
+        c->inputs_[which].push_back(guard->files_meta[j]);
+      }
+      c->guards_inputs[which].push_back(added_all_guards[i]);
+    }
+  }
+  return c;
 }
 
 Compaction* VersionSet::PickCompaction() {
@@ -1423,7 +2145,8 @@ Compaction* VersionSet::PickCompaction() {
   c->input_version_ = current_;
   c->input_version_->Ref();
 
-  // Files in level 0 may overlap each other, so pick up all overlapping ones
+  // Files in level 0 may overlap each other, so pick up all overlapping
+  // ones
   if (level == 0) {
     InternalKey smallest, largest;
     GetRange(c->inputs_[0], &smallest, &largest);
@@ -1479,10 +2202,10 @@ FileMetaData* FindSmallestBoundaryFile(
   return smallest_boundary_file;
 }
 
-// Extracts the largest file b1 from |compaction_files| and then searches for
-// a b2 in |level_files| for which user_key(u1) = user_key(l2). If it finds
-// such a file b2 (known as a boundary file) it adds it to |compaction_files|
-// and then searches again using this new upper bound.
+// Extracts the largest file b1 from |compaction_files| and then searches
+// for a b2 in |level_files| for which user_key(u1) = user_key(l2). If it
+// finds such a file b2 (known as a boundary file) it adds it to
+// |compaction_files| and then searches again using this new upper bound.
 //
 // If there are two blocks, b1=(l1, u1) and b2=(l2, u2) and
 // user_key(u1) = user_key(l2), and if we compact b1 but not b2 then a
@@ -1509,7 +2232,8 @@ void AddBoundaryInputs(const InternalKeyComparator& icmp,
     FileMetaData* smallest_boundary_file =
         FindSmallestBoundaryFile(icmp, level_files, largest_key);
 
-    // If a boundary file was found advance largest_key, otherwise we're done.
+    // If a boundary file was found advance largest_key, otherwise we're
+    // done.
     if (smallest_boundary_file != NULL) {
       compaction_files->push_back(smallest_boundary_file);
       largest_key = smallest_boundary_file->largest;
@@ -1582,6 +2306,47 @@ void VersionSet::SetupOtherInputs(Compaction* c) {
   c->edit_.SetCompactPointer(level, largest);
 }
 
+void VersionSet::AdjustInputs(int which, Compaction* c) {
+  for (size_t i = 0; i < c->sentinel_files[which].size(); ++i) {
+    c->inputs_[which].emplace_back(c->sentinel_files[which][i]);
+  }
+  for (size_t i = 0; i < c->guards_inputs[which].size(); ++i) {
+    const GuardMetaData* guard = c->guards_inputs[which][i];
+    for (size_t j = 0; j < guard->files_meta.size(); ++j) {
+      c->inputs_[which].emplace_back(guard->files_meta[j]);
+    }
+  }
+}
+
+Compaction* VersionSet::CompactRangeForGuard(int level,
+                                             const InternalKey* begin,
+                                             const InternalKey* end) {
+  std::vector<FileMetaData*> sentinel_files[2];
+  std::vector<GuardMetaData*> guards[2];
+  current_->GetOverlappingInputsForGuard(level, begin, end, &sentinel_files[0],
+                                         &guards[0]);
+  if (sentinel_files[0].size() + guards[0].size() == 0) {
+    return nullptr;
+  }
+  current_->GetOverlappingInputsForGuard(level + 1, begin, end,
+                                         &sentinel_files[1], &guards[1]);
+
+  Compaction* c = new Compaction(options_, level);
+  c->input_version_ = current_;
+  c->input_version_->Ref();
+  c->sentinel_files[0] = sentinel_files[0];
+  c->sentinel_files[1] = sentinel_files[1];
+  c->guards_inputs[0] = guards[0];
+  c->guards_inputs[1] = guards[1];
+  AdjustInputs(0, c);
+  AdjustInputs(1, c);
+  Log(options_->info_log, "level-%d sentinel_files:%ld", level,
+      sentinel_files[0].size());
+  Log(options_->info_log, "level-%d sentinel_files:%ld", level + 1,
+      sentinel_files[1].size());
+  return c;
+}
+
 Compaction* VersionSet::CompactRange(int level, const InternalKey* begin,
                                      const InternalKey* end) {
   std::vector<FileMetaData*> inputs;
@@ -1639,12 +2404,41 @@ bool Compaction::IsTrivialMove() const {
               MaxGrandParentOverlapBytes(vset->options_));
 }
 
+void Compaction::AddInputDeletionsForGuard(VersionEdit* edit) {
+  for (int which = 0; which < 2; ++which) {
+    for (size_t i = 0; i < sentinel_files[which].size(); ++i) {
+      edit->RemoveFile(level_ + which, sentinel_files[which][i]->number);
+    }
+    for (size_t i = 0; i < guards_inputs[which].size(); ++i) {
+      const std::vector<FileMetaData*>& guards_file =
+          guards_inputs[which][i]->files_meta;
+      for (size_t j = 0; j < guards_file.size(); ++j) {
+        edit->RemoveFile(level_ + which, guards_file[j]->number);
+      }
+    }
+  }
+}
+
 void Compaction::AddInputDeletions(VersionEdit* edit) {
   for (int which = 0; which < 2; which++) {
     for (size_t i = 0; i < inputs_[which].size(); i++) {
       edit->RemoveFile(level_ + which, inputs_[which][i]->number);
     }
   }
+}
+
+bool Compaction::IsBaseLevelForKeyForGuard(const Slice& user_key) {
+  // Maybe use binary search to find right entry instead of linear search?
+  const Comparator* user_cmp = input_version_->vset_->icmp_.user_comparator();
+  for (int lvl = level_ + 1; lvl < config::kNumLevels; lvl++) {
+    const std::vector<FileMetaData*>& files = input_version_->files_[lvl];
+    int num = FindFile(input_version_->vset_->icmp_, files, user_key, true);
+    if (num < files.size()) {
+      if (user_cmp->Compare(user_key, files[num]->smallest.user_key()) >= 0)
+        return false;
+    }
+  }
+  return true;
 }
 
 bool Compaction::IsBaseLevelForKey(const Slice& user_key) {

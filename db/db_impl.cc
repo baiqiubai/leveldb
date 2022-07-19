@@ -37,6 +37,7 @@
 #include "table/two_level_iterator.h"
 #include "util/coding.h"
 #include "util/logging.h"
+#include "util/murmurhash3.h"
 #include "util/mutexlock.h"
 
 #include "ac-key/arc_cache.h"
@@ -214,6 +215,18 @@ DBImpl::~DBImpl() {
   if (owns_cache_) {
     delete options_.block_cache;
   }
+}
+
+size_t DBImpl::NumGuardAtLevel(int level) const {
+  return versions_->current()->NumGuardAtLevel(level);
+}
+
+size_t DBImpl::NumUnCommittedGuardAtLevel(int level) const {
+  return versions_->current()->NumUnCommittedGuardAtLevel(level);
+}
+
+size_t DBImpl::NumSentinelFilesAtLevel(int level) const {
+  return versions_->current()->NumSentinelFilesAtLevel(level);
 }
 
 Status DBImpl::ScanNumOfValue(const ReadOptions& options, const Slice* start,
@@ -612,9 +625,6 @@ Status DBImpl::WriteLevel0Table(MemTable* mem, VersionEdit* edit,
   if (s.ok() && meta.file_size > 0) {
     const Slice min_user_key = meta.smallest.user_key();
     const Slice max_user_key = meta.largest.user_key();
-    if (base != nullptr) {
-      level = base->PickLevelForMemTableOutput(min_user_key, max_user_key);
-    }
     edit->AddFile(level, meta.number, meta.file_size, meta.smallest,
                   meta.largest);
   }
@@ -756,7 +766,7 @@ void DBImpl::MaybeScheduleCompaction() {
   } else if (!bg_error_.ok()) {
     // Already got an error; no more changes
   } else if (imm_ == nullptr && manual_compaction_ == nullptr &&
-             !versions_->NeedsCompaction()) {
+             !versions_->NeedsCompactionForGuard()) {
     // No work to be done
   } else {
     background_compaction_scheduled_ = true;
@@ -777,7 +787,8 @@ void DBImpl::BackgroundCall() {
   } else if (!bg_error_.ok()) {
     // No more background work after a background error.
   } else {
-    BackgroundCompaction();
+    // BackgroundCompaction();
+    BackgroundCompactionForGuard();
   }
 
   MaybeScheduleGC();
@@ -792,7 +803,7 @@ void DBImpl::BackgroundCall() {
 
 Status DBImpl::InsertBlobToCache(
     const std::unordered_map<uint64_t, uint64_t>& blob_list) {
-  Log(options_.info_log, "Discard Blob File Size:%ld", blob_list.size());
+  // Log(options_.info_log, "Discard Blob File Size:%ld", blob_list.size());
   for (auto& [blob_number, blob_file_size] : blob_list) {
     Iterator* iter = blob_cache_->NewIterator(ReadOptions(), blob_number,
                                               blob_file_size, nullptr);
@@ -864,6 +875,77 @@ Status DBImpl::StartGC(
   }
   return Status::OK();
 }
+
+void DBImpl::BackgroundCompactionForGuard() {
+  mutex_.AssertHeld();
+
+  if (imm_ != nullptr) {
+    CompactMemTable();
+    return;
+  }
+
+  Compaction* c = nullptr;
+  bool is_manual = (manual_compaction_ != nullptr);
+  InternalKey manual_end;
+  int level = -1;
+  std::vector<GuardMetaData*> uncommitted_guards;
+  if (is_manual) {
+    ManualCompaction* m = manual_compaction_;
+    c = versions_->CompactRangeForGuard(m->level, m->begin, m->end);
+    m->done = (c == nullptr);
+    if (c != nullptr) {
+      if (c->num_input_files(0) >= 1) {
+        manual_end = c->input(0, c->num_input_files(0) - 1)->largest;
+      }
+    }
+    Log(options_.info_log,
+        "Manual compaction at level-%d from %s .. %s; will stop at %s\n",
+        m->level, (m->begin ? m->begin->DebugString().c_str() : "(begin)"),
+        (m->end ? m->end->DebugString().c_str() : "(end)"),
+        (m->done ? "(end)" : manual_end.DebugString().c_str()));
+  } else {
+    level = versions_->PickCompactionLevel();
+    c = versions_->GetInputGuardsAndFiles(&uncommitted_guards, level);
+  }
+  Status status;
+
+  if (c == nullptr) {
+  } else {
+    CompactionState* state = new CompactionState(c);
+    status = DoCompactionWorkForGuard(state, uncommitted_guards);
+    if (!status.ok()) {
+      RecordBackgroundError(status);
+    }
+    versions_->CleanGenerateBlobList();
+    collector_->Clear();
+    c->ReleaseInputs();
+    RemoveObsoleteFiles();
+  }
+  delete c;
+
+  if (status.ok()) {
+    // Done
+  } else if (shutting_down_.load(std::memory_order_acquire)) {
+    // Ignore compaction errors found during shutting down
+  } else {
+    Log(options_.info_log, "Compaction error: %s", status.ToString().c_str());
+  }
+
+  if (is_manual) {
+    ManualCompaction* m = manual_compaction_;
+    if (!status.ok()) {
+      m->done = true;
+    }
+    if (!m->done) {
+      // We only compacted part of the requested range.  Update *m
+      // to the range that is left to be compacted.
+      m->tmp_storage = manual_end;
+      m->begin = &m->tmp_storage;
+    }
+    manual_compaction_ = nullptr;
+  }
+}
+
 void DBImpl::BackgroundCompaction() {
   mutex_.AssertHeld();
 
@@ -1022,6 +1104,7 @@ Status DBImpl::FinishCompaction(CompactionState* compact, Iterator* input) {
           BlobFileName(dbname_, compact->current_outputblobfile()->number);
       env_->RemoveFile(delete_blob_name);
       compact->PopOutBlobFile();
+      versions_->PopBackBlobList();
     }
     s = FinishCompactionOutputFile(compact, false, input);
   }
@@ -1108,6 +1191,32 @@ Status DBImpl::FinishCompactionOutputFile(CompactionState* compact,
   return s;
 }
 
+Status DBImpl::InstallCompactionResultsForGuard(
+    CompactionState* compact,
+    const std::vector<GuardMetaData*>& uncommitted_guard) {
+  mutex_.AssertHeld();
+  Log(options_.info_log, "Compacted %d@%d + %d@%d files => %lld bytes",
+      compact->compaction->num_input_files(0), compact->compaction->level(),
+      compact->compaction->num_input_files(1), compact->compaction->level() + 1,
+      static_cast<long long>(compact->total_bytes));
+
+  // Add compaction outputs
+  compact->compaction->AddInputDeletionsForGuard(compact->compaction->edit());
+  const int level = compact->compaction->level();
+  for (size_t i = 0; i < compact->outputs.size(); i++) {
+    const CompactionState::Output& out = compact->outputs[i];
+    compact->compaction->edit()->AddFile(level + 1, out.number, out.file_size,
+                                         out.smallest, out.largest);
+  }
+  // Add uncommitted guards
+  for (auto& guard : uncommitted_guard) {
+    compact->compaction->edit()->AddNewUncommittedGuard(
+        compact->compaction->level(), *guard);
+  }
+
+  return versions_->LogAndApply(compact->compaction->edit(), &mutex_);
+}
+
 Status DBImpl::InstallCompactionResults(CompactionState* compact) {
   mutex_.AssertHeld();
   Log(options_.info_log, "Compacted %d@%d + %d@%d files => %lld bytes",
@@ -1125,6 +1234,219 @@ Status DBImpl::InstallCompactionResults(CompactionState* compact) {
   }
 
   return versions_->LogAndApply(compact->compaction->edit(), &mutex_);
+}
+
+Status DBImpl::DoCompactionWorkForGuard(
+    CompactionState* compact,
+    const std::vector<GuardMetaData*>& uncommitted_guard) {
+  const uint64_t start_micros = env_->NowMicros();
+  int64_t imm_micros = 0;  // Micros spent doing imm_ compactions
+
+  Log(options_.info_log, "Compacting %d@%d + %d@%d files",
+      compact->compaction->num_input_files(0), compact->compaction->level(),
+      compact->compaction->num_input_files(1),
+      compact->compaction->level() + 1);
+
+  // assert(versions_->NumLevelFiles(compact->compaction->level()) > 0);
+  assert(compact->builder == nullptr);
+  assert(compact->outfile == nullptr);
+
+  if (snapshots_.empty()) {
+    compact->smallest_snapshot = versions_->LastSequence();
+  } else {
+    compact->smallest_snapshot = snapshots_.oldest()->sequence_number();
+  }
+
+  Iterator* input = versions_->MakeInputIteratorForGuard(compact->compaction);
+
+  // Release mutex while we're actually doing the compaction work
+  mutex_.Unlock();
+
+  input->SeekToFirst();
+  Status status;
+  ParsedInternalKey ikey;
+  std::string current_user_key;
+  bool has_current_user_key = false;
+  SequenceNumber last_sequence_for_key = kMaxSequenceNumber;
+  uint32_t uncommitted_guard_index = 0;
+  size_t uncommitted_guard_size = uncommitted_guard.size();
+  while (input->Valid() && !shutting_down_.load(std::memory_order_acquire)) {
+    // Prioritize immutable compaction work
+    if (has_imm_.load(std::memory_order_relaxed)) {
+      const uint64_t imm_start = env_->NowMicros();
+      mutex_.Lock();
+      if (imm_ != nullptr) {
+        CompactMemTable();
+        // Wake up MakeRoomForWrite() if necessary.
+        background_work_finished_signal_.SignalAll();
+      }
+      mutex_.Unlock();
+      imm_micros += (env_->NowMicros() - imm_start);
+    }
+
+    Slice key = input->key();
+    if (compact->compaction->ShouldStopBefore(key) &&
+        compact->builder != nullptr) {
+      status = FinishCompaction(compact, input);
+      if (!status.ok()) {
+        break;
+      }
+    }
+
+    // Handle key/value, add to state, etc.
+    bool drop = false;
+    if (!ParseInternalKey(key, &ikey)) {
+      // Do not hide error keys
+      current_user_key.clear();
+      has_current_user_key = false;
+      last_sequence_for_key = kMaxSequenceNumber;
+    } else {
+      if (!has_current_user_key ||
+          user_comparator()->Compare(ikey.user_key, Slice(current_user_key)) !=
+              0) {
+        // First occurrence of this user key
+        current_user_key.assign(ikey.user_key.data(), ikey.user_key.size());
+        has_current_user_key = true;
+        last_sequence_for_key = kMaxSequenceNumber;
+      }
+
+      if (last_sequence_for_key <= compact->smallest_snapshot) {
+        // Hidden by an newer entry for same user key
+        drop = true;  // (A)
+      } else if (ikey.type == kTypeDeletion &&
+                 ikey.sequence <= compact->smallest_snapshot &&
+                 compact->compaction->IsBaseLevelForKeyForGuard(
+                     ikey.user_key)) {
+        // For this user key:
+        // (1) there is no data in higher levels
+        // (2) data in lower levels will have larger sequence numbers
+        // (3) data in layers that are being compacted here and have
+        //     smaller sequence numbers will be dropped in the next
+        //     few iterations of this loop (by rule (A) above).
+        // Therefore this deletion marker is obsolete and can be dropped.
+        drop = true;
+      }
+
+      last_sequence_for_key = ikey.sequence;
+    }
+#if 0
+    Log(options_.info_log,
+        "  Compact: %s, seq %d, type: %d %d, drop: %d, is_base: %d, "
+        "%d smallest_snapshot: %d",
+        ikey.user_key.ToString().c_str(),
+        (int)ikey.sequence, ikey.type, kTypeValue, drop,
+        compact->compaction->IsBaseLevelForKey(ikey.user_key),
+        (int)last_sequence_for_key, (int)compact->smallest_snapshot);
+#endif
+
+    uint64_t blob_number = input->GetBlobNumber();
+    uint64_t blob_file_size = input->GetBlobSize();
+
+    if (!drop) {
+      if (uncommitted_guard_size) {
+        while (uncommitted_guard_index < uncommitted_guard_size) {
+          if (user_comparator()->Compare(
+                  key, uncommitted_guard[uncommitted_guard_index]
+                           ->guard_key.Encode()) < 0) {
+            // Open output file if necessary
+            if (compact->builder == nullptr) {
+              status = OpenCompactionOutputFile(compact);
+              if (!status.ok()) {
+                goto out;
+              }
+            }
+
+            if (compact->builder->NumEntries() == 0) {
+              compact->current_output()->smallest.DecodeFrom(key);
+            }
+            compact->current_output()->largest.DecodeFrom(key);
+
+            status = AddKVInSSTAndBlob(compact, key, input->value(),
+                                       blob_number, blob_file_size);
+            if (!status.ok()) {
+              goto out;
+            }
+            break;
+          } else {
+            status = FinishCompaction(compact, input);
+            if (!status.ok()) {
+              goto out;
+            }
+            ++uncommitted_guard_index;
+          }
+        }
+      } else {
+        // Open output file if necessary
+        if (compact->builder == nullptr) {
+          status = OpenCompactionOutputFile(compact);
+          if (!status.ok()) {
+            goto out;
+          }
+        }
+        if (compact->builder->NumEntries() == 0) {
+          compact->current_output()->smallest.DecodeFrom(key);
+        }
+        compact->current_output()->largest.DecodeFrom(key);
+
+        status = AddKVInSSTAndBlob(compact, key, input->value(), blob_number,
+                                   blob_file_size);
+        if (!status.ok()) {
+          break;
+        }
+      }
+    } else {
+      if (input->value().data()[0] == KVSeparation::kSeparation) {
+        uint64_t discard_size = static_cast<uint64_t>(key.size()) +
+                                static_cast<uint64_t>(input->value().size());
+        assert(blob_number > 0);
+        collector_->SetBlobFileSize(blob_number, blob_file_size);
+        collector_->AddDiscardSize(blob_number, discard_size);
+        UpdateKVCache(key);
+      }
+    }
+
+    input->Next();
+  }
+
+out:
+  if (status.ok() && shutting_down_.load(std::memory_order_acquire)) {
+    status = Status::IOError("Deleting DB during compaction");
+  }
+  if (status.ok() && compact->builder != nullptr) {
+    status = FinishCompaction(compact, input);
+  }
+  if (status.ok()) {
+    status = input->status();
+  }
+  delete input;
+  input = nullptr;
+
+  CompactionStats stats;
+  stats.micros = env_->NowMicros() - start_micros - imm_micros;
+  for (int which = 0; which < 2; which++) {
+    for (int i = 0; i < compact->compaction->num_input_files(which); i++) {
+      stats.bytes_read += compact->compaction->input(which, i)->file_size;
+    }
+  }
+  for (size_t i = 0; i < compact->outputs.size(); i++) {
+    stats.bytes_written += compact->outputs[i].file_size;
+  }
+
+  mutex_.Lock();
+  stats_[compact->compaction->level() + 1].Add(stats);
+
+  if (status.ok()) {
+    status = InstallCompactionResultsForGuard(compact, uncommitted_guard);
+  }
+  if (!status.ok()) {
+    RecordBackgroundError(status);
+  }
+  VersionSet::LevelSummaryStorage tmp;
+  VersionSet::BlobSummaryStorage blob_tmp;
+  Log(options_.info_log, "compacted to: %s", versions_->LevelSummary(&tmp));
+  Log(options_.info_log, "generated to: %s",
+      versions_->GenerateBlobSummary(&blob_tmp));
+  return status;
 }
 
 Status DBImpl::DoCompactionWork(CompactionState* compact) {
@@ -1408,7 +1730,8 @@ Iterator* DBImpl::NewInternalIterator(const ReadOptions& options,
     list.push_back(imm_->NewIterator());
     imm_->Ref();
   }
-  versions_->current()->AddIterators(options, &list);
+  //  versions_->current()->AddIterators(options, &list);
+  versions_->current()->AddIteratorsForGuard(options, &list);
   Iterator* internal_iter =
       NewMergingIterator(&internal_comparator_, &list[0], list.size());
   versions_->current()->Ref();
@@ -1556,7 +1879,8 @@ Status DBImpl::Write(const WriteOptions& options, WriteBatch* updates) {
         }
       }
       if (status.ok()) {
-        status = WriteBatchInternal::InsertInto(write_batch, mem_);
+        status = WriteBatchInternal::InsertIntoVersion(write_batch, mem_,
+                                                       versions_->current());
       }
       mutex_.Lock();
       if (sync_error) {
@@ -1790,6 +2114,36 @@ void DBImpl::GetApproximateSizes(const Range* range, int n, uint64_t* sizes) {
 // can call if they wish
 Status DB::Put(const WriteOptions& opt, const Slice& key, const Slice& value) {
   WriteBatch batch;
+  // Need to hash and check the last few bits.
+  void* input = (void*)key.data();
+  size_t size = key.size();
+  const unsigned int murmur_seed = 42;
+  unsigned int hash_result;
+  MurmurHash3_x86_32(input, size, murmur_seed, &hash_result);
+
+  // Go through each level, starting from the top and checking if it
+  // is a guard on that level.
+  unsigned bit_mask = 0;
+  unsigned num_bits = top_level_bits;
+
+  for (unsigned i = 0; i < config::kNumLevels; i++) {
+    SetMask(&bit_mask, num_bits);
+    if (i == 0) {
+      num_bits -= bit_decrement;
+      continue;
+    }
+    if ((hash_result & bit_mask) == bit_mask) {
+      fprintf(stderr, "Select start level %d\n", i);
+      // found a guard
+      // Insert the guard to this level and all the lower levels
+      for (unsigned j = i; j < config::kNumLevels; j++) {
+        batch.PutGuard(key, j);
+      }
+      break;
+    }
+    // Check next level
+    num_bits -= bit_decrement;
+  }
   batch.Put(key, value);
   return Write(opt, &batch);
 }

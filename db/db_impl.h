@@ -37,6 +37,7 @@ class VersionEdit;
 class VersionSet;
 struct FileMetaData;
 struct BlobFileMetaData;
+struct GuardMetaData;
 
 class DBImpl : public DB {
  public:
@@ -94,6 +95,10 @@ class DBImpl : public DB {
   void RecordReadSample(Slice key);
 
   BlobCache* GetBlobCache();
+
+  size_t NumGuardAtLevel(int level) const;
+  size_t NumUnCommittedGuardAtLevel(int level) const;
+  size_t NumSentinelFilesAtLevel(int level) const;
 
  private:
   friend class DB;
@@ -170,10 +175,15 @@ class DBImpl : public DB {
   static void BGWork(void* db);
   void BackgroundCall();
   void BackgroundCompaction() EXCLUSIVE_LOCKS_REQUIRED(mutex_);
+  void BackgroundCompactionForGuard() EXCLUSIVE_LOCKS_REQUIRED(mutex_);
   void CleanupCompaction(CompactionState* compact)
       EXCLUSIVE_LOCKS_REQUIRED(mutex_);
   Status DoCompactionWork(CompactionState* compact)
       EXCLUSIVE_LOCKS_REQUIRED(mutex_);
+  Status DoCompactionWorkForGuard(
+      CompactionState* compact,
+      const std::vector<GuardMetaData*>& uncommitted_guard);
+  EXCLUSIVE_LOCKS_REQUIRED(mutex_);
 
   Status OpenCompactionOutputFile(CompactionState* compact);
   Status FinishCompaction(CompactionState* compact, Iterator* input);
@@ -183,6 +193,10 @@ class DBImpl : public DB {
                                     bool* blob_is_empty = nullptr);
   Status InstallCompactionResults(CompactionState* compact)
       EXCLUSIVE_LOCKS_REQUIRED(mutex_);
+  Status InstallCompactionResultsForGuard(
+      CompactionState* compact,
+      const std::vector<GuardMetaData*>& uncommitted_guard);
+  EXCLUSIVE_LOCKS_REQUIRED(mutex_);
 
   const Comparator* user_comparator() const {
     return internal_comparator_.user_comparator();

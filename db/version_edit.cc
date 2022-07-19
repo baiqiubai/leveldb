@@ -22,6 +22,8 @@ enum Tag {
   kNewFile = 7,
   kPrevLogNumber = 8,
   kBlobNumber = 9,
+  kUncommittedGuard = 10,
+  kFullGuard = 11,
 };
 
 void VersionEdit::Clear() {
@@ -39,6 +41,8 @@ void VersionEdit::Clear() {
   has_blob_file_number_ = false;
   deleted_files_.clear();
   new_files_.clear();
+  new_uncommitted_guards_->clear();
+  new_guards_->clear();
 }
 
 void VersionEdit::EncodeTo(std::string* dst) const {
@@ -89,6 +93,24 @@ void VersionEdit::EncodeTo(std::string* dst) const {
     PutLengthPrefixedSlice(dst, f.smallest.Encode());
     PutLengthPrefixedSlice(dst, f.largest.Encode());
   }
+  for (size_t level = 0; level < config::kNumLevels; ++level) {
+    const std::vector<GuardMetaData>& guards = new_guards_[level];
+    for (size_t i = 0; i < guards.size(); ++i) {
+      PutVarint32(dst, kFullGuard);
+      PutVarint32(dst, guards[i].level);
+      PutVarint64(dst, guards[i].num_of_segments);
+      PutLengthPrefixedSlice(dst, guards[i].guard_key.Encode());
+    }
+  }
+  for (size_t level = 0; level < config::kNumLevels; ++level) {
+    const std::vector<GuardMetaData>& guards = new_uncommitted_guards_[level];
+    for (size_t i = 0; i < guards.size(); ++i) {
+      PutVarint32(dst, kUncommittedGuard);
+      PutVarint32(dst, guards[i].level);
+      PutVarint64(dst, guards[i].num_of_segments);
+      PutLengthPrefixedSlice(dst, guards[i].guard_key.Encode());
+    }
+  }
 }
 
 static bool GetInternalKey(Slice* input, InternalKey* dst) {
@@ -121,6 +143,7 @@ Status VersionEdit::DecodeFrom(const Slice& src) {
   uint64_t number;
   FileMetaData f;
   BlobFileMetaData blob_meta;
+  GuardMetaData uncommitted_guard, guard;
   Slice str;
   InternalKey key;
 
@@ -200,6 +223,23 @@ Status VersionEdit::DecodeFrom(const Slice& src) {
           msg = "new-file entry";
         }
         break;
+      case kFullGuard:
+        if (GetLevel(&input, &guard.level) &&
+            GetVarint64(&input, &guard.num_of_segments) &&
+            GetInternalKey(&input, &guard.guard_key)) {
+          new_guards_[guard.level].push_back(guard);
+        } else {
+          msg = "Full guard entry";
+        }
+      case kUncommittedGuard:
+        if (GetLevel(&input, &uncommitted_guard.level) &&
+            GetVarint64(&input, &uncommitted_guard.num_of_segments) &&
+            GetInternalKey(&input, &uncommitted_guard.guard_key)) {
+          new_uncommitted_guards_[uncommitted_guard.level].push_back(
+              uncommitted_guard);
+        } else {
+          msg = "uncommitted guard entry";
+        }
       default:
         msg = "unknown tag";
         break;
