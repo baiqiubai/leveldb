@@ -25,6 +25,10 @@ namespace leveldb {
 namespace config {
 static const int kNumLevels = 7;
 
+static const int kL0_MaxSentinelFiles = 4;
+
+static const int kMaxFilesPerGuard = 2;
+
 // Level-0 compaction is started when we hit this many files.
 static const int kL0_CompactionTrigger = 4;
 
@@ -52,7 +56,11 @@ class InternalKey;
 // Value types encoded as the last component of internal keys.
 // DO NOT CHANGE THESE ENUM VALUES: they are embedded in the on-disk
 // data structures.
-enum ValueType { kTypeDeletion = 0x0, kTypeValue = 0x1 };
+enum ValueType {
+  kTypeDeletion = 0x0,
+  kTypeGuard = 0x1,
+  kTypeValue = 0x2,
+};
 // kValueTypeForSeek defines the ValueType that should be passed when
 // constructing a ParsedInternalKey object for seeking to a particular
 // sequence number (since we sort sequence numbers in decreasing order
@@ -70,6 +78,15 @@ static const SequenceNumber kMaxSequenceNumber = ((0x1ull << 56) - 1);
 static const uint64_t kInValidBlobFileSize = 0;
 
 static const uint64_t kInValidBlobFileNumber = 0;
+
+static const unsigned top_level_bits = 27;
+
+static const int bit_decrement = 2;
+
+static void SetMask(unsigned* bit_mask, unsigned num_bits) {
+  assert(num_bits > 0 && num_bits < 32);
+  *bit_mask = (1 << num_bits) - 1;
+}
 
 enum KVSeparation : char {
   kNoSeparation = 0x0,
