@@ -9,6 +9,7 @@
 // record :=
 //    kTypeValue varstring varstring         |
 //    kTypeDeletion varstring
+//    kTypeGuard varstring varint32
 // varstring :=
 //    len: varint32
 //    data: uint8[len]
@@ -17,6 +18,7 @@
 
 #include "db/dbformat.h"
 #include "db/memtable.h"
+#include "db/version_set.h"
 #include "db/write_batch_internal.h"
 
 #include "leveldb/db.h"
@@ -49,6 +51,7 @@ Status WriteBatch::Iterate(Handler* handler) const {
 
   input.remove_prefix(kHeader);
   Slice key, value;
+  uint32_t level = 0;
   int found = 0;
   while (!input.empty()) {
     found++;
@@ -68,6 +71,14 @@ Status WriteBatch::Iterate(Handler* handler) const {
           handler->Delete(key);
         } else {
           return Status::Corruption("bad WriteBatch Delete");
+        }
+        break;
+      case kTypeGuard:
+        if (GetLengthPrefixedSlice(&input, &key) &&
+            GetVarint32(&input, &level)) {
+          handler->InsertGuard(key, level);
+        } else {
+          return Status::Corruption("bad WriteBatch Guard");
         }
         break;
       default:
@@ -104,6 +115,13 @@ void WriteBatch::Put(const Slice& key, const Slice& value) {
   PutLengthPrefixedSlice(&rep_, value);
 }
 
+void WriteBatch::PutGuard(const Slice& key, uint32_t level) {
+  WriteBatchInternal::SetCount(this, WriteBatchInternal::Count(this) + 1);
+  rep_.push_back(static_cast<char>(kTypeGuard));
+  PutLengthPrefixedSlice(&rep_, key);
+  PutVarint32(&rep_, level);
+}
+
 void WriteBatch::Delete(const Slice& key) {
   WriteBatchInternal::SetCount(this, WriteBatchInternal::Count(this) + 1);
   rep_.push_back(static_cast<char>(kTypeDeletion));
@@ -119,6 +137,10 @@ class MemTableInserter : public WriteBatch::Handler {
  public:
   SequenceNumber sequence_;
   MemTable* mem_;
+  Version* version_;
+
+  MemTableInserter(SequenceNumber sequence, MemTable* mem, Version* version)
+      : sequence_(sequence), mem_(mem), version_(version) {}
 
   void Put(const Slice& key, const Slice& value) override {
     mem_->Add(sequence_, kTypeValue, key, value);
@@ -128,13 +150,27 @@ class MemTableInserter : public WriteBatch::Handler {
     mem_->Add(sequence_, kTypeDeletion, key, Slice());
     sequence_++;
   }
+  void InsertGuard(const Slice& key, uint32_t level) override {
+    GuardMetaData* guard = new GuardMetaData();
+    guard->refs = 1;
+    guard->num_of_segments = 0;
+    guard->level = level;
+    InternalKey internal_key(key, sequence_, kTypeValue);
+    guard->guard_key = internal_key;
+    version_->AddUnCommittedGuard(level, guard);
+    sequence_++;
+  }
 };
 }  // namespace
 
 Status WriteBatchInternal::InsertInto(const WriteBatch* b, MemTable* memtable) {
-  MemTableInserter inserter;
-  inserter.sequence_ = WriteBatchInternal::Sequence(b);
-  inserter.mem_ = memtable;
+  return InsertIntoVersion(b, memtable, nullptr);
+}
+
+Status WriteBatchInternal::InsertIntoVersion(const WriteBatch* b,
+                                             MemTable* memtable,
+                                             Version* version) {
+  MemTableInserter inserter(WriteBatchInternal::Sequence(b), memtable, version);
   return b->Iterate(&inserter);
 }
 

@@ -37,6 +37,7 @@ class LEVELDB_EXPORT WriteBatch {
     virtual ~Handler();
     virtual void Put(const Slice& key, const Slice& value) = 0;
     virtual void Delete(const Slice& key) = 0;
+    virtual void InsertGuard(const Slice& key, uint32_t level) = 0;
   };
 
   WriteBatch();
@@ -49,6 +50,8 @@ class LEVELDB_EXPORT WriteBatch {
 
   // Store the mapping "key->value" in the database.
   void Put(const Slice& key, const Slice& value);
+
+  void PutGuard(const Slice& key, uint32_t level);
 
   // If the database contains a mapping for "key", erase it.  Else do nothing.
   void Delete(const Slice& key);
