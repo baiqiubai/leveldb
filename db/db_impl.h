@@ -170,20 +170,13 @@ class DBImpl : public DB {
 
   void RecordBackgroundError(const Status& s);
 
-  void MaybeScheduleCompaction() EXCLUSIVE_LOCKS_REQUIRED(mutex_);
   void MaybeScheduleGC() EXCLUSIVE_LOCKS_REQUIRED(mutex_);
-  static void BGWork(void* db);
-  void BackgroundCall();
   void BackgroundCompaction() EXCLUSIVE_LOCKS_REQUIRED(mutex_);
-  void BackgroundCompactionForGuard() EXCLUSIVE_LOCKS_REQUIRED(mutex_);
   void CleanupCompaction(CompactionState* compact)
       EXCLUSIVE_LOCKS_REQUIRED(mutex_);
-  Status DoCompactionWork(CompactionState* compact)
+  Status DoCompactionWork(CompactionState* compact,
+                          const std::vector<GuardMetaData*>& uncommitted_guard)
       EXCLUSIVE_LOCKS_REQUIRED(mutex_);
-  Status DoCompactionWorkForGuard(
-      CompactionState* compact,
-      const std::vector<GuardMetaData*>& uncommitted_guard);
-  EXCLUSIVE_LOCKS_REQUIRED(mutex_);
 
   Status OpenCompactionOutputFile(CompactionState* compact);
   Status FinishCompaction(CompactionState* compact, Iterator* input);
@@ -191,9 +184,7 @@ class DBImpl : public DB {
                                     bool is_compact_blob_file = true,
                                     Iterator* input = nullptr,
                                     bool* blob_is_empty = nullptr);
-  Status InstallCompactionResults(CompactionState* compact)
-      EXCLUSIVE_LOCKS_REQUIRED(mutex_);
-  Status InstallCompactionResultsForGuard(
+  Status InstallCompactionResults(
       CompactionState* compact,
       const std::vector<GuardMetaData*>& uncommitted_guard);
   EXCLUSIVE_LOCKS_REQUIRED(mutex_);
@@ -212,6 +203,11 @@ class DBImpl : public DB {
                            uint64_t blob_file_size);
   void UpdateKPCache(const Slice& key, const Slice& blob_offset);
   void UpdateKVCache(const Slice& key);
+
+  static void CompactMemTableThreadWrapper(void* db);
+  static void CompactSSTThreadWrapper(void* db);
+  void CompactMemTableThread();
+  void CompactSSTThread();
 
   // Constant after construction
   Env* const env_;
@@ -233,7 +229,11 @@ class DBImpl : public DB {
   // State below is protected by mutex_
   port::Mutex mutex_;
   std::atomic<bool> shutting_down_;
+  std::atomic<int> num_of_background_thread_;
   port::CondVar background_work_finished_signal_ GUARDED_BY(mutex_);
+  port::CondVar foreground_process_cond_ GUARDED_BY(mutex_);  //前台进程等待的
+  port::CondVar memtable_compact_cond_ GUARDED_BY(mutex_);
+  port::CondVar sst_compact_cond_ GUARDED_BY(mutex_);
   MemTable* mem_;
   MemTable* imm_ GUARDED_BY(mutex_);  // Memtable being compacted
   std::atomic<bool> has_imm_;         // So bg thread can detect non-null imm_

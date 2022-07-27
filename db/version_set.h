@@ -58,9 +58,16 @@ int FindGuard(const InternalKeyComparator& icmp,
 // largest==nullptr represents a key largest than all keys in the DB.
 // REQUIRES: If disjoint_sorted_files, files[] contains disjoint ranges
 //           in sorted order.
+
 bool SomeFileOverlapsRange(const InternalKeyComparator& icmp,
                            bool disjoint_sorted_files,
                            const std::vector<FileMetaData*>& files,
+                           const Slice* smallest_user_key,
+                           const Slice* largest_user_key);
+
+bool SomeFileOverlapsRange(const InternalKeyComparator& icmp, bool is_level0,
+                           const std::vector<FileMetaData*>& sentinels_file,
+                           const std::vector<GuardMetaData*>& guards,
                            const Slice* smallest_user_key,
                            const Slice* largest_user_key);
 
@@ -82,8 +89,6 @@ class Version {
   // REQUIRES: This version has been saved (see VersionSet::SaveTo)
   void AddIterators(const ReadOptions&, std::vector<Iterator*>* iters);
 
-  void AddIteratorsForGuard(const ReadOptions&, std::vector<Iterator*>* iters);
-
   Status Get(const ReadOptions&, const LookupKey& key, std::string* val,
              GetStats* stats);
 
@@ -103,15 +108,10 @@ class Version {
   void Ref();
   void Unref();
 
-  void GetOverlappingInputs(
-      int level,
-      const InternalKey* begin,  // nullptr means before all keys
-      const InternalKey* end,    // nullptr means after all keys
-      std::vector<FileMetaData*>* inputs);
-  void GetOverlappingInputsForGuard(int level, const InternalKey* begin,
-                                    const InternalKey* end,
-                                    std::vector<FileMetaData*>* sentinel_files,
-                                    std::vector<GuardMetaData*>* guards);
+  void GetOverlappingInputs(int level, const InternalKey* begin,
+                            const InternalKey* end,
+                            std::vector<FileMetaData*>* sentinel_files,
+                            std::vector<GuardMetaData*>* guards);
   void GetOverlappingWithSentinelFiles(
       int level, const InternalKey* begin, const InternalKey* end,
       std::vector<FileMetaData*>* sentinel_files);
@@ -127,8 +127,6 @@ class Version {
   // DB's keys.
   bool OverlapInLevel(int level, const Slice* smallest_user_key,
                       const Slice* largest_user_key);
-  bool OverlapInLevelForGuard(int level, const Slice* smallest_user_key,
-                              const Slice* largest_user_key);
 
   // Return the level at which we should place a new memtable compaction
   // result that covers the range [smallest_user_key,largest_user_key].
@@ -295,26 +293,17 @@ class VersionSet {
   // the result.
   Compaction* CompactRange(int level, const InternalKey* begin,
                            const InternalKey* end);
-
-  Compaction* CompactRangeForGuard(int level, const InternalKey* begin,
-                                   const InternalKey* end);
   // Return the maximum overlapping data (in bytes) at next level for any
   // file at a level >= 1.
   int64_t MaxNextLevelOverlappingBytes();
 
   // Create an iterator that reads over the compaction inputs for "*c".
   // The caller should delete the iterator when no longer needed.
+
   Iterator* MakeInputIterator(Compaction* c);
 
-  Iterator* MakeInputIteratorForGuard(Compaction* c);
-
   // Returns true iff some level needs a compaction.
-  bool NeedsCompaction() const {
-    Version* v = current_;
-    return (v->compaction_score_ >= 1) || (v->file_to_compact_ != nullptr);
-  }
-
-  bool NeedsCompactionForGuard() const;
+  bool NeedsCompaction() const;
 
   // Add all files listed in any live version to *live.
   // May also mutate some internal state.
@@ -374,8 +363,6 @@ class VersionSet {
                  const std::vector<FileMetaData*>& inputs2,
                  InternalKey* smallest, InternalKey* largest);
 
-  void SetupOtherInputs(Compaction* c);
-
   // Save current contents to *log
   Status WriteSnapshot(log::Writer* log);
 
@@ -434,25 +421,13 @@ class Compaction {
   // Maximum size of files to build during this compaction.
   uint64_t MaxOutputFileSize() const { return max_output_file_size_; }
 
-  // Is this a trivial compaction that can be implemented by just
-  // moving a single input file to the next level (no merging or splitting)
-  bool IsTrivialMove() const;
-
   // Add all inputs to this compaction as delete operations to *edit.
   void AddInputDeletions(VersionEdit* edit);
-
-  void AddInputDeletionsForGuard(VersionEdit* edit);
 
   // Returns true if the information we have available guarantees that
   // the compaction is producing data in "level+1" for which no data exists
   // in levels greater than "level+1".
   bool IsBaseLevelForKey(const Slice& user_key);
-
-  bool IsBaseLevelForKeyForGuard(const Slice& user_key);
-
-  // Returns true iff we should stop building the current output
-  // before processing "internal_key".
-  bool ShouldStopBefore(const Slice& internal_key);
 
   // Release the input version for the compaction, once the compaction
   // is successful.
@@ -473,14 +448,6 @@ class Compaction {
   std::vector<FileMetaData*> inputs_[2];  // The two sets of inputs
   std::vector<GuardMetaData*> guards_inputs[2];
   std::vector<FileMetaData*> sentinel_files[2];
-
-  // State used to check for number of overlapping grandparent files
-  // (parent == level_ + 1, grandparent == level_ + 2)
-  std::vector<FileMetaData*> grandparents_;
-  size_t grandparent_index_;  // Index in grandparent_starts_
-  bool seen_key_;             // Some output key has been seen
-  int64_t overlapped_bytes_;  // Bytes of overlap between current output
-                              // and grandparent files
 };
 
 Iterator* GetGuardFileIterator(void* arg, const ReadOptions& options,
