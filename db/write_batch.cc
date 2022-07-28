@@ -24,6 +24,7 @@
 #include "leveldb/db.h"
 
 #include "util/coding.h"
+#include "util/murmurhash3.h"
 
 namespace leveldb {
 
@@ -113,6 +114,7 @@ void WriteBatch::Put(const Slice& key, const Slice& value) {
   rep_.push_back(static_cast<char>(kTypeValue));
   PutLengthPrefixedSlice(&rep_, key);
   PutLengthPrefixedSlice(&rep_, value);
+  WriteBatchInternal::SelectGuard(this, key);
 }
 
 void WriteBatch::PutGuard(const Slice& key, uint32_t level) {
@@ -126,6 +128,7 @@ void WriteBatch::Delete(const Slice& key) {
   WriteBatchInternal::SetCount(this, WriteBatchInternal::Count(this) + 1);
   rep_.push_back(static_cast<char>(kTypeDeletion));
   PutLengthPrefixedSlice(&rep_, key);
+  WriteBatchInternal::SelectGuard(this, key);
 }
 
 void WriteBatch::Append(const WriteBatch& source) {
@@ -183,6 +186,38 @@ void WriteBatchInternal::Append(WriteBatch* dst, const WriteBatch* src) {
   SetCount(dst, Count(dst) + Count(src));
   assert(src->rep_.size() >= kHeader);
   dst->rep_.append(src->rep_.data() + kHeader, src->rep_.size() - kHeader);
+}
+
+void WriteBatchInternal::SelectGuard(WriteBatch* batch, const Slice& key) {
+  // Need to hash and check the last few bits.
+  void* input = (void*)key.data();
+  size_t size = key.size();
+  const unsigned int murmur_seed = 42;
+  unsigned int hash_result;
+  MurmurHash3_x86_32(input, size, murmur_seed, &hash_result);
+
+  // Go through each level, starting from the top and checking if it
+  // is a guard on that level.
+  unsigned bit_mask = 0;
+  unsigned num_bits = top_level_bits;
+
+  for (unsigned i = 0; i < config::kNumLevels; i++) {
+    SetMask(&bit_mask, num_bits);
+    if (i == 0) {
+      num_bits -= bit_decrement;
+      continue;
+    }
+    if ((hash_result & bit_mask) == bit_mask) {
+      // found a guard
+      // Insert the guard to this level and all the lower levels
+      for (unsigned j = i; j < config::kNumLevels; j++) {
+        batch->PutGuard(key, j);
+      }
+      break;
+    }
+    // Check next level
+    num_bits -= bit_decrement;
+  }
 }
 
 }  // namespace leveldb

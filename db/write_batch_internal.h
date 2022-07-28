@@ -41,6 +41,7 @@ class WriteBatchInternal {
 
   static Status InsertIntoVersion(const WriteBatch* batch, MemTable* memtable,
                                   Version* version);
+  static void SelectGuard(WriteBatch* batch, const Slice& key);
 
   static void Append(WriteBatch* dst, const WriteBatch* src);
 };

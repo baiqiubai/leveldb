@@ -142,6 +142,7 @@ class VersionEdit {
   DeletedFileSet deleted_files_;
   std::vector<std::pair<int, FileMetaData>> new_files_;
 
+  std::vector<FileMetaData> new_sentinel_files_[config::kNumLevels];
   std::vector<GuardMetaData> new_uncommitted_guards_[config::kNumLevels];
   std::vector<GuardMetaData> new_guards_[config::kNumLevels];
 };
