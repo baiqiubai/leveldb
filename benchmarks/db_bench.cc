@@ -824,7 +824,7 @@ class Benchmark {
     int i = 0;
     int64_t bytes = 0;
     std::vector<std::pair<std::string, std::string>> kv;
-    Status s = db_->ScanNumOfEntries(ReadOptions(), Slice(), reads_, &kv);
+    Status s = db_->ScanNumOfEntries(ReadOptions(),nullptr, reads_, &kv);
     assert(s.ok());
     for (auto& [k, v] : kv) {
       bytes += k.size() + v.size();

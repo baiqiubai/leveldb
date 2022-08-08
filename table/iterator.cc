@@ -30,6 +30,12 @@ uint64_t Iterator::GetBlobNumber() const { return 0; }
 
 uint64_t Iterator::GetBlobSize() const { return 0; }
 
+void Iterator::SetIterType(bool is_mem_iter) { is_mem_iter_ = is_mem_iter; }
+
+void Iterator::SetCallback(const std::function<void(bool)>& callback) {}
+
+bool Iterator::IsMemIter() const { return is_mem_iter_; }
+
 void Iterator::RegisterCleanup(CleanupFunction func, void* arg1, void* arg2) {
   assert(func != nullptr);
   CleanupNode* node;

@@ -355,6 +355,8 @@ void leveldb_writebatch_iterate(const leveldb_writebatch_t* b, void* state,
     void Delete(const Slice& key) override {
       (*deleted_)(state_, key.data(), key.size());
     }
+    void InsertGuard(const Slice&key,uint32_t level){
+    }
   };
   H handler;
   handler.state_ = state;

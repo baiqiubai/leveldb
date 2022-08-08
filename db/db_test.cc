@@ -2,8 +2,6 @@
 // Use of this source code is governed by a BSD-style license that can be
 // found in the LICENSE file. See the AUTHORS file for names of contributors.
 
-#include "leveldb/db.h"
-
 #include "db/db_impl.h"
 #include "db/filename.h"
 #include "db/memtable.h"
@@ -17,6 +15,7 @@
 #include <typeinfo>
 
 #include "leveldb/cache.h"
+#include "leveldb/db.h"
 #include "leveldb/env.h"
 #include "leveldb/filter_policy.h"
 #include "leveldb/table.h"
@@ -601,6 +600,17 @@ class DBTest : public testing::Test {
   int option_config_;
   std::unique_ptr<ParsedDBIterator> parsed_;
 };
+
+TEST_F(DBTest, GetFromKPCache) {
+  Options options;
+  options.value_separation_threshold = 3;
+  Reopen(&options);
+
+  ASSERT_LEVELDB_OK(Put("key", "value"));
+  dbfull()->TEST_CompactMemTable();
+  ASSERT_EQ(Get("key"), "value");  //放到kp cache
+  ASSERT_EQ(Get("key"), "value");  //从kp cache中找到
+}
 
 TEST_F(DBTest, Empty) {
   do {
@@ -2196,7 +2206,6 @@ static void BM_LogAndApply(benchmark::State& state) {
 }
 
 BENCHMARK(BM_LogAndApply)->Arg(1)->Arg(100)->Arg(10000)->Arg(100000);
-
 }  // namespace leveldb
 
 int main(int argc, char** argv) {

@@ -25,7 +25,7 @@ namespace leveldb {
 namespace config {
 static const int kNumLevels = 7;
 
-static const int kL0_MaxSentinelFiles = 4;
+static const int kL0_MaxSentinelFiles = 2;
 
 static const int kMaxFilesPerGuard = 2;
 
@@ -44,6 +44,7 @@ static const int kL0_StopWritesTrigger = 12;
 // expensive manifest file operations.  We do not push all the way to
 // the largest level since that can generate a lot of wasted disk
 // space if the same key space is being repeatedly overwritten.
+
 static const int kMaxMemCompactLevel = 2;
 
 // Approximate gap in bytes between samples of data read during iteration.
