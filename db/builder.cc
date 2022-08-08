@@ -2,7 +2,6 @@
 // Use of this source code is governed by a BSD-style license that can be
 // found in the LICENSE file. See the AUTHORS file for names of contributors.
 #include "db/builder.h"
-
 #include "db/dbformat.h"
 #include "db/filename.h"
 #include "db/version_edit.h"
@@ -66,14 +65,19 @@ Status FlushBuilderAndRecordState(BlobWapper* blob_wapper,
   return s;
 }
 
-void UpdateAdaptiveCache(const Slice& key, const Slice& value, Cache** cache,
-                         const KPValue& kpvalue) {
-  Cache::Handle* handle = (*cache)->Lookup(key);
+void UpdateAdaptiveCache(const Slice& internal_key, const Slice& value,
+                         Cache** cache, const KPValue& kpvalue) {
+  ParsedInternalKey parsed_key;
+  if (!ParseInternalKey(internal_key, &parsed_key)) {
+    return;
+  }
+
+  Cache::Handle* handle = (*cache)->Lookup(parsed_key.user_key);
   LRUHandle* lru_handle = reinterpret_cast<LRUHandle*>(handle);
 
   if (handle != nullptr) {
     HandleType handle_type = lru_handle->handle_type;
-    size_t handle_size = key.size();
+    size_t handle_size = parsed_key.user_key.size();
     std::string* new_value = nullptr;
 
     if (lru_handle->handle_type == HandleType::kKPHandle) {
@@ -89,7 +93,8 @@ void UpdateAdaptiveCache(const Slice& key, const Slice& value, Cache** cache,
     double caching_factor = CalculateCachingFactor(0, handle_type, handle_size);
 
     (*cache)->Release(handle);
-    handle = (*cache)->Insert(key, reinterpret_cast<void*>(new_value), 1,
+    handle = (*cache)->Insert(parsed_key.user_key,
+                              reinterpret_cast<void*>(new_value), 1,
                               DeleteHandle, handle_type, caching_factor);
 
     (*cache)->Release(handle);

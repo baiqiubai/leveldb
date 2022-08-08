@@ -2,12 +2,11 @@
 // Use of this source code is governed by a BSD-style license that can be
 // found in the LICENSE file. See the AUTHORS file for names of contributors.
 
-#include "db/version_set.h"
-
 #include "db/filename.h"
 #include "db/log_reader.h"
 #include "db/log_writer.h"
 #include "db/memtable.h"
+#include "db/version_set.h"
 #include <algorithm>
 #include <cstdio>
 
@@ -613,10 +612,10 @@ Status Version::Get(const ReadOptions& options, const LookupKey& k,
       return state->s;
     }
 
-    static void SearchInAdaptiveCache(State* state, const Slice& internal_key,
+    static void SearchInAdaptiveCache(State* state, const Slice& user_key,
                                       HitCacheType* hit_cache_type, int level) {
       Cache* cache = state->vset->adaptive_cache_;
-      Cache::Handle* handle = cache->Lookup(internal_key);
+      Cache::Handle* handle = cache->Lookup(user_key);
       LRUHandle* lru_handle = reinterpret_cast<LRUHandle*>(handle);
 
       if (handle != nullptr) {
@@ -629,6 +628,7 @@ Status Version::Get(const ReadOptions& options, const LookupKey& k,
         } else if (lru_handle->hit_cache_type ==
                    HitCacheType::kKPRealCache) {  //击中kpcache
                                                   //提升kpcache为kvcache
+
           uint64_t blob_number = 0;
           uint64_t blob_file_size = 0;
 
@@ -642,13 +642,14 @@ Status Version::Get(const ReadOptions& options, const LookupKey& k,
               level, HandleType::kKVHandle, value->size());
 
           cache->Release(handle);
-          handle = cache->Insert(internal_key, reinterpret_cast<void*>(value),
-                                 1, DeleteHandle, HandleType::kKVHandle,
+          handle = cache->Insert(user_key, reinterpret_cast<void*>(value), 1,
+                                 DeleteHandle, HandleType::kKVHandle,
                                  caching_factor);
           cache->Release(handle);
         }
 
         *hit_cache_type = lru_handle->hit_cache_type;
+        state->found = kFound;
       } else {
         *hit_cache_type = HitCacheType::kNoHitCache;
       }
@@ -666,7 +667,7 @@ Status Version::Get(const ReadOptions& options, const LookupKey& k,
         double caching_factor =
             CalculateCachingFactor(level, HandleType::kKVHandle, value->size());
 
-        handle = cache->Insert(state->ikey, value, 1, DeleteHandle,
+        handle = cache->Insert(state->saver.user_key, value, 1, DeleteHandle,
                                HandleType::kKVHandle, caching_factor);
       } else {
         std::string encode_value;
@@ -677,9 +678,9 @@ Status Version::Get(const ReadOptions& options, const LookupKey& k,
         double caching_factor =
             CalculateCachingFactor(level, HandleType::kKPHandle, value->size());
 
-        handle =
-            cache->Insert(state->ikey, reinterpret_cast<void*>(value), 1,
-                          DeleteHandle, HandleType::kKPHandle, caching_factor);
+        handle = cache->Insert(state->saver.user_key,
+                               reinterpret_cast<void*>(value), 1, DeleteHandle,
+                               HandleType::kKPHandle, caching_factor);
       }
       cache->Release(handle);
     }
@@ -695,7 +696,8 @@ Status Version::Get(const ReadOptions& options, const LookupKey& k,
       }
 
       HitCacheType hit_cache_type = HitCacheType::kNoHitCache;
-      SearchInAdaptiveCache(state, state->ikey, &hit_cache_type, level);
+      SearchInAdaptiveCache(state, state->saver.user_key, &hit_cache_type,
+                            level);
 
       //没有查到或者击中幽灵缓存 需要走sst->blob
       if (hit_cache_type != HitCacheType::kKVRealCache &&
@@ -1806,7 +1808,8 @@ int VersionSet::PickCompactionLevel() const {
   for (int level = 0; level < config::kNumLevels - 2; ++level) {
     double score = current_->compaction_scores_[level];
     if (current_->compaction_scores_[level] >= 1.0 &&
-        current_->compaction_scores_[level + 1] < 1.0) {
+        current_->compaction_scores_[level] >=
+            current_->compaction_scores_[level + 1]) {
       Log(options_->info_log, "Compact Select Level-%d", level);
       return level;
     }
@@ -1815,6 +1818,7 @@ int VersionSet::PickCompactionLevel() const {
     Log(options_->info_log, "Compact Select Level-%d", config::kNumLevels - 1);
     return config::kNumLevels - 1;
   }
+
   return -1;
 }
 
