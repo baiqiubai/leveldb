@@ -2,12 +2,13 @@
 // Use of this source code is governed by a BSD-style license that can be
 // found in the LICENSE file. See the AUTHORS file for names of contributors.
 
-#include "leveldb/cache.h"
-
 #include <vector>
 
-#include "gtest/gtest.h"
+#include "leveldb/cache.h"
+
 #include "util/coding.h"
+
+#include "gtest/gtest.h"
 
 namespace leveldb {
 
@@ -51,12 +52,13 @@ class CacheTest : public testing::Test {
 
   void Insert(int key, int value, int charge = 1) {
     cache_->Release(cache_->Insert(EncodeKey(key), EncodeValue(value), charge,
-                                   &CacheTest::Deleter));
+                                   &CacheTest::Deleter,
+                                   HandleType::kBlockHandle, 0));
   }
 
   Cache::Handle* InsertAndReturnHandle(int key, int value, int charge = 1) {
     return cache_->Insert(EncodeKey(key), EncodeValue(value), charge,
-                          &CacheTest::Deleter);
+                          &CacheTest::Deleter, HandleType::kBlockHandle, 0);
   }
 
   void Erase(int key) { cache_->Erase(EncodeKey(key)); }
