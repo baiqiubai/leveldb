@@ -198,11 +198,11 @@ class DBImpl : public DB {
       VersionEdit* edit);
   Status InsertBlobToCache(
       const std::unordered_map<uint64_t, uint64_t>& blob_list);
-  Status AddKVInSSTAndBlob(CompactionState* compact, const Slice& key,
+  Status AddKVInSSTAndBlob(CompactionState* compact, const Slice& internal_key,
                            const Slice& value, uint64_t blob_file_number,
                            uint64_t blob_file_size);
-  void UpdateKPCache(const Slice& key, const Slice& blob_offset);
-  void UpdateKVCache(const Slice& key);
+  void UpdateKPCache(const Slice& user_key, const Slice& blob_offset);
+  void UpdateKVCache(const Slice& user_key);
 
   static void CompactMemTableThreadWrapper(void* db);
   static void CompactSSTThreadWrapper(void* db);

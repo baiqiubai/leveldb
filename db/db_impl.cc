@@ -2,9 +2,8 @@
 // Use of this source code is governed by a BSD-style license that can be
 // found in the LICENSE file. See the AUTHORS file for names of contributors.
 
-#include "db/db_impl.h"
-
 #include "db/builder.h"
+#include "db/db_impl.h"
 #include "db/db_iter.h"
 #include "db/dbformat.h"
 #include "db/filename.h"
@@ -697,9 +696,8 @@ void DBImpl::CompactSSTThreadWrapper(void* arg) {
 }
 
 void DBImpl::CompactMemTableThread() {
+  MutexLock lock(&mutex_);
   while (!shutting_down_.load(std::memory_order_acquire)) {
-    MutexLock lock(&mutex_);
-    mutex_.AssertHeld();
     while (!shutting_down_.load(std::memory_order_acquire) && imm_ == nullptr) {
       memtable_compact_cond_.Wait();
     }
@@ -717,8 +715,8 @@ void DBImpl::CompactMemTableThread() {
 }
 
 void DBImpl::CompactSSTThread() {
+  MutexLock lock(&mutex_);
   while (!shutting_down_.load(std::memory_order_acquire)) {
-    MutexLock lock(&mutex_);
     while (!shutting_down_.load(std::memory_order_acquire) &&
            manual_compaction_ == nullptr && !versions_->NeedsCompaction()) {
       sst_compact_cond_.Wait();
@@ -1179,6 +1177,7 @@ Status DBImpl::DoCompactionWork(
   SequenceNumber last_sequence_for_key = kMaxSequenceNumber;
   uint32_t uncommitted_guard_index = 0;
   size_t uncommitted_guard_size = uncommitted_guard.size();
+  bool key_has_max_sequence = false;
   while (input->Valid() && !shutting_down_.load(std::memory_order_acquire)) {
     Slice key = input->key();
     // Handle key/value, add to state, etc.
@@ -1196,6 +1195,10 @@ Status DBImpl::DoCompactionWork(
         current_user_key.assign(ikey.user_key.data(), ikey.user_key.size());
         has_current_user_key = true;
         last_sequence_for_key = kMaxSequenceNumber;
+      }
+
+      if (last_sequence_for_key == kMaxSequenceNumber) {
+        key_has_max_sequence = true;
       }
 
       if (last_sequence_for_key <= compact->smallest_snapshot) {
@@ -1270,8 +1273,10 @@ Status DBImpl::DoCompactionWork(
       }
       compact->current_output()->largest.DecodeFrom(key);
 
-      status = AddKVInSSTAndBlob(compact, key, input->value(), blob_number,
-                                 blob_file_size);
+      if (key_has_max_sequence) {  //只有当该key对应的internal_key的序列号最大时候才更新Cache,因为有可能存在丢弃的快照
+        status = AddKVInSSTAndBlob(compact, key, input->value(), blob_number,
+                                   blob_file_size);
+      }
       if (!status.ok()) {
         break;
       }
@@ -1283,11 +1288,14 @@ Status DBImpl::DoCompactionWork(
         assert(blob_number > 0);
         collector_->SetBlobFileSize(blob_number, blob_file_size);
         collector_->AddDiscardSize(blob_number, discard_size);
-        UpdateKVCache(key);
+        if (key_has_max_sequence) {
+          UpdateKVCache(key);
+        }
       }
     }
 
     input->Next();
+    key_has_max_sequence = false;
   }
 
   if (status.ok() && shutting_down_.load(std::memory_order_acquire)) {
@@ -1331,14 +1339,15 @@ Status DBImpl::DoCompactionWork(
   return status;
 }
 
-Status DBImpl::AddKVInSSTAndBlob(CompactionState* compact, const Slice& key,
-                                 const Slice& value, uint64_t blob_file_number,
+Status DBImpl::AddKVInSSTAndBlob(CompactionState* compact,
+                                 const Slice& internal_key, const Slice& value,
+                                 uint64_t blob_file_number,
                                  uint64_t blob_file_size) {
   Status s;
 
   assert(value.size() >= 1);
   if (value.data()[0] == KVSeparation::kNoSeparation) {
-    compact->builder->Add(key, value);
+    compact->builder->Add(internal_key, value);
   } else if (value.data()[0] == KVSeparation::kSeparation) {
     assert(value.size() == 9);
     std::string offset;
@@ -1351,30 +1360,34 @@ Status DBImpl::AddKVInSSTAndBlob(CompactionState* compact, const Slice& key,
     s = parsed_offset_->ParseValue(blob_file_number, blob_file_size,
                                    blob_offset);
     if (s.ok()) {
-      compact->builder->Add(key, encode_value);
-      compact->blob_builder->Add(key, parsed_offset_->GetValue());
-      UpdateKPCache(key, offset);
+      compact->builder->Add(internal_key, encode_value);
+      compact->blob_builder->Add(internal_key, parsed_offset_->GetValue());
+      ParsedInternalKey parsed_key;
+      if (ParseInternalKey(internal_key, &parsed_key)) {
+        UpdateKPCache(parsed_key.user_key, offset);
+      } else {
+        return Status::Corruption("ParseInternalKey error");
+      }
     }
   }
   return s;
 }
 
-void DBImpl::UpdateKPCache(const Slice& key, const Slice& blob_offset) {
-  Cache::Handle* handle = adaptive_cache_->Lookup(key);
-  LRUHandle* lru_handle = nullptr;
+void DBImpl::UpdateKPCache(const Slice& user_key, const Slice& blob_offset) {
+  Cache::Handle* handle = adaptive_cache_->Lookup(user_key);
+  LRUHandle* lru_handle = reinterpret_cast<LRUHandle*>(handle);
 
   if (handle != nullptr) {
-    lru_handle = reinterpret_cast<LRUHandle*>(handle);
     if (lru_handle->handle_type == HandleType::kKPHandle) {
       std::string* value =
           new std::string(blob_offset.data(), blob_offset.size());
 
       adaptive_cache_->Release(handle);
-      adaptive_cache_->Erase(key);
+      adaptive_cache_->Erase(user_key);
 
       double caching_factor = 0.0;
       handle = adaptive_cache_->Insert(
-          key, reinterpret_cast<std::string*>(value), 1, DeleteHandle,
+          user_key, reinterpret_cast<std::string*>(value), 1, DeleteHandle,
           HandleType::kKPHandle, caching_factor);
 
       adaptive_cache_->Release(handle);
@@ -1382,15 +1395,15 @@ void DBImpl::UpdateKPCache(const Slice& key, const Slice& blob_offset) {
   }
 }
 
-void DBImpl::UpdateKVCache(const Slice& key) {
-  Cache::Handle* handle = adaptive_cache_->Lookup(key);
+void DBImpl::UpdateKVCache(const Slice& user_key) {
+  Cache::Handle* handle = adaptive_cache_->Lookup(user_key);
   LRUHandle* lru_handle = nullptr;
 
   if (handle != nullptr) {
     lru_handle = reinterpret_cast<LRUHandle*>(handle);
     assert(lru_handle->handle_type == HandleType::kKVHandle);
     adaptive_cache_->Release(handle);
-    adaptive_cache_->Erase(key);
+    adaptive_cache_->Erase(user_key);
   }
 }
 
@@ -1686,7 +1699,8 @@ Status DBImpl::MakeRoomForWrite(bool force) {
       // case it is sharing the same core as the writer.
       Log(options_.info_log, "Delay write;waiting...\n");
       mutex_.Unlock();
-      env_->SleepForMicroseconds(1000);
+      env_->SleepForMicroseconds(versions_->NumLevelFiles(0) -
+                                 config::kL0_SlowdownWritesTrigger);
       allow_delay = false;  // Do not delay a single write more than once
       mutex_.Lock();
     } else if (!force &&
