@@ -187,6 +187,8 @@ target_sources(leveldb
     "util/options.cc"
     "util/random.h"
     "util/status.cc"
+    "util/murmurhash3.cc"
+    "util/murmurhash3.h"
     "blob/prefetcher.h"
     "blob/prefetcher.cc"
     "blob/threadpool.h"
@@ -199,6 +201,11 @@ target_sources(leveldb
     "blob/blob_builder.cc"
     "blob/drop_entries_collector.h"
     "blob/drop_entries_collector.cc"
+    "ac-key/arc_cache.cc"
+    "ac-key/arc_cache.h"
+    "ac-key/cache_format.h"
+    "ac-key/cache_format.cc"
+
 
   # Only CMake 3.3+ supports PUBLIC sources in targets exported by "install".
   $<$<VERSION_GREATER:CMAKE_VERSION,3.2>:PUBLIC>
